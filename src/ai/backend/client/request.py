@@ -336,15 +336,6 @@ class Request:
 
 
 class BaseResponse:
-    """
-    Represents the Backend.AI API response.
-    Also serves as a high-level wrapper of :class:`aiohttp.ClientResponse`.
-
-    The response objects are meant to be created by the SDK, not the callers.
-
-    :func:`text`, :func:`json` methods return the resolved content directly with
-    plain synchronous Session while they return the coroutines with AsyncSession.
-    """
 
     __slots__ = (
         "_session",

@@ -531,3 +531,267 @@ class WebSocketResponse(BaseResponse):
         if self._raw_ws.closed:
             raise aiohttp.ServerDisconnectedError("server disconnected")
         await self._raw_ws.send_bytes(data)
+
+        @property
+    def closed(self) -> bool:
+        return self._raw_ws.closed
+
+    async def close(self) -> None:
+        await self._raw_ws.close()
+
+    def __aiter__(self) -> AsyncIterator[aiohttp.WSMessage]:
+        return self._raw_ws.__aiter__()
+
+    def exception(self) -> Optional[BaseException]:
+        return self._raw_ws.exception()
+
+    async def send_str(self, raw_str: str) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_str(raw_str)
+
+    async def send_json(self, obj: Any) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_json(obj)
+
+    async def send_bytes(self, data: bytes) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_bytes(data)
+
+    async def receive_str(self) -> str:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        return await self._raw_ws.receive_str()
+
+    async def receive_json(self) -> Any:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        return await self._raw_ws.receive_json()
+
+    async def receive_bytes(self) -> bytes:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        return await self._raw_ws.receive_bytes()
+
+
+class WebSocketContextManager:
+    """
+    The context manager returned by :func:`Request.connect_websocket`.
+    """
+
+    __slots__ = (
+        "session",
+        "ws_ctx_builder",
+        "response_cls",
+        "on_enter",
+        "_ws_ctx",
+    )
+
+    _ws_ctx: Optional[_WSRequestContextManager]
+
+    def __init__(
+        self,
+        session: BaseSession,
+        ws_ctx_builder: Callable[[], _WSRequestContextManager],
+        *,
+        on_enter: Callable = None,
+        response_cls: Type[WebSocketResponse] = WebSocketResponse,
+    ) -> None:
+        self.session = session
+        self.ws_ctx_builder = ws_ctx_builder
+        self.response_cls = response_cls
+        self.on_enter = on_enter
+        self._ws_ctx = None
+
+    async def __aenter__(self) -> WebSocketResponse:
+        max_retries = len(self.session.config.endpoints)
+        retry_count = 0
+        while True:
+            try:
+                retry_count += 1
+                self._ws_ctx = self.ws_ctx_builder()
+                assert self._ws_ctx is not None
+                raw_ws = await self._ws_ctx.__aenter__()
+            except aiohttp.ClientConnectionError as e:
+                if retry_count == max_retries:
+                    msg = (
+                        "Request to the API endpoint has failed.\n"
+                        "Check your network connection and/or the server status.\n"
+                        "Error detail: {!r}".format(e)
+                    )
+                    raise BackendClientError(msg) from e
+                else:
+                    self.session.config.rotate_endpoints()
+                    continue
+            except aiohttp.ClientResponseError as e:
+                msg = "API endpoint response error.\n\u279c {!r}".format(e)
+                raise BackendClientError(msg) from e
+            else:
+                break
+            finally:
+                self.session.config.load_balance_endpoints()
+
+        wrapped_ws = self.response_cls(self.session, cast(aiohttp.ClientResponse, raw_ws))
+        if self.on_enter is not None:
+            await self.on_enter(wrapped_ws)
+        return wrapped_ws
+
+    async def __aexit__(self, *args) -> Optional[bool]:
+        assert self._ws_ctx is not None
+        await self._ws_ctx.__aexit__(*args)
+        self._ws_ctx = None
+        return None
+
+
+@attrs.define(auto_attribs=True, slots=True, frozen=True)
+class SSEMessage:
+    event: str
+    data: str
+    id: Optional[str] = None
+    retry: Optional[int] = None
+
+
+class SSEResponse(BaseResponse):
+    __slots__ = (
+        "_auto_reconnect",
+        "_retry",
+        "_connector",
+    )
+
+    def __init__(
+        self,
+        session: BaseSession,
+        underlying_response: aiohttp.ClientResponse,
+        *,
+        connector: Callable[[], Awaitable[aiohttp.ClientResponse]],
+        auto_reconnect: bool = True,
+        default_retry: int = 5,
+        **kwargs,
+    ) -> None:
+        super().__init__(session, underlying_response, async_mode=True, **kwargs)
+        self._auto_reconnect = auto_reconnect
+        self._retry = default_retry
+        self._connector = connector
+
+    async def fetch_events(self) -> AsyncIterator[SSEMessage]:
+        msg_lines: List[str] = []
+        server_closed = False
+        while True:
+            received_line = await self._raw_response.content.readline()
+            if not received_line:
+                if self._auto_reconnect and not server_closed:
+                    await asyncio.sleep(self._retry)
+                    self._raw_response = await self._connector()
+                    continue
+                else:
+                    break
+            received_line = received_line.strip(b"\r\n")
+            if received_line.startswith(b":"):
+                continue
+            if not received_line:
+                if len(msg_lines) == 0:
+                    continue
+                event_type = "message"
+                event_id = None
+                event_retry = None
+                data_lines = []
+                try:
+                    for stored_line in msg_lines:
+                        hdr, text = stored_line.split(":", maxsplit=1)
+                        text = text.lstrip(" ")
+                        if hdr == "data":
+                            data_lines.append(text)
+                        elif hdr == "event":
+                            event_type = text
+                        elif hdr == "id":
+                            event_id = text
+                        elif hdr == "retry":
+                            event_retry = int(text)
+                except (IndexError, ValueError):
+                    log.exception("SSEResponse: parsing-error")
+                    continue
+                event_data = "\n".join(data_lines)
+                msg_lines.clear()
+                if event_retry is not None:
+                    self._retry = event_retry
+                yield SSEMessage(
+                    event=event_type,
+                    data=event_data,
+                    id=event_id,
+                    retry=event_retry,
+                )
+                if event_type == "server_close":
+                    server_closed = True
+                    break
+            else:
+                msg_lines.append(received_line.decode("utf-8"))
+
+    def __aiter__(self) -> AsyncIterator[SSEMessage]:
+        return self.fetch_events()
+
+
+class SSEContextManager:
+    __slots__ = (
+        "session",
+        "rqst_ctx_builder",
+        "response_cls",
+        "_rqst_ctx",
+    )
+
+    _rqst_ctx: Optional[_RequestContextManager]
+
+    def __init__(
+        self,
+        session: BaseSession,
+        rqst_ctx_builder: Callable[[], _RequestContextManager],
+        *,
+        response_cls: Type[SSEResponse] = SSEResponse,
+    ) -> None:
+        self.session = session
+        self.rqst_ctx_builder = rqst_ctx_builder
+        self.response_cls = response_cls
+        self._rqst_ctx = None
+
+    async def reconnect(self) -> aiohttp.ClientResponse:
+        if self._rqst_ctx is not None:
+            await self._rqst_ctx.__aexit__(None, None, None)
+        self._rqst_ctx = self.rqst_ctx_builder()
+        assert self._rqst_ctx is not None
+        raw_resp = await self._rqst_ctx.__aenter__()
+        if raw_resp.status // 100 != 2:
+            msg = await raw_resp.text()
+            raise BackendAPIError(raw_resp.status, raw_resp.reason or "", msg)
+        return raw_resp
+
+    async def __aenter__(self) -> SSEResponse:
+        max_retries = len(self.session.config.endpoints)
+        retry_count = 0
+        while True:
+            try:
+                retry_count += 1
+                raw_resp = await self.reconnect()
+                return self.response_cls(self.session, raw_resp, connector=self.reconnect)
+            except aiohttp.ClientConnectionError as e:
+                if retry_count == max_retries:
+                    msg = (
+                        "Request to the API endpoint has failed.\n"
+                        "Check your network connection and/or the server status.\n"
+                        "\u279c {!r}".format(e)
+                    )
+                    raise BackendClientError(msg) from e
+                else:
+                    self.session.config.rotate_endpoints()
+                    continue
+            except aiohttp.ClientResponseError as e:
+                msg = "API endpoint response error.\n\u279c {!r}".format(e)
+                raise BackendClientError(msg) from e
+            finally:
+                self.session.config.load_balance_endpoints()
+
+    async def __aexit__(self, *args) -> Optional[bool]:
+        assert self._rqst_ctx is not None
+        await self._rqst_ctx.__aexit__(*args)
+        self._rqst_ctx = None
+        return None

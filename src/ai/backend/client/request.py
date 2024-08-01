@@ -203,8 +203,6 @@ class Request:
             for f in self._attached_files:
                 data.add_field("src", f.stream, filename=f.filename, content_type=f.content_type)
             assert data.is_multipart, "Failed to pack files as multipart."
-            # Let aiohttp fill up the content-type header including
-            # multipart boundaries.
             self.headers.pop("Content-Type", None)
             return data
         else:
@@ -221,8 +219,6 @@ class Request:
         if self.params:
             url = url.with_query(self.params)
         return url
-
-    # TODO: attach rate-limit information
 
     def fetch(self, **kwargs) -> FetchContextManager:
         """
@@ -288,7 +284,6 @@ class Request:
         self.date = datetime.now(tzutc())
         assert self.date is not None
         self.headers["Date"] = self.date.isoformat()
-        # websocket is always a "binary" stream.
         self.content_type = "application/octet-stream"
 
         def _ws_ctx_builder():
@@ -336,30 +331,230 @@ class Request:
         return SSEContextManager(self.session, _rqst_ctx_builder, **kwargs)
 
 
-class AsyncResponseMixin:
-    _session: BaseSession
-    _raw_response: aiohttp.ClientResponse
-
-    async def text(self) -> str:
-        return await self._raw_response.text()
-
-    async def json(self, *, loads=modjson.loads) -> Any:
+        def json(self, *, loads=modjson.loads) -> Any:
         loads = functools.partial(loads, object_pairs_hook=OrderedDict)
-        return await self._raw_response.json(loads=loads)
-
-    async def read(self, n: int = -1) -> bytes:
-        return await self._raw_response.content.read(n)
-
-    async def readall(self) -> bytes:
-        return await self._raw_response.content.read(-1)
-
-
-class SyncResponseMixin:
-    _session: BaseSession
-    _raw_response: aiohttp.ClientResponse
-
-    def text(self) -> str:
         sync_session = cast(SyncSession, self._session)
         return sync_session.worker_thread.execute(
-            self._raw_response.text(),
+            self._raw_response.json(loads=loads),
         )
+
+    def read(self, n: int = -1) -> bytes:
+        sync_session = cast(SyncSession, self._session)
+        return sync_session.worker_thread.execute(
+            self._raw_response.content.read(n),
+        )
+
+    def readall(self) -> bytes:
+        sync_session = cast(SyncSession, self._session)
+        return sync_session.worker_thread.execute(
+            self._raw_response.content.read(-1),
+        )
+
+
+class BaseResponse:
+    """
+    Represents the Backend.AI API response.
+    Also serves as a high-level wrapper of :class:`aiohttp.ClientResponse`.
+
+    The response objects are meant to be created by the SDK, not the callers.
+
+    :func:`text`, :func:`json` methods return the resolved content directly with
+    plain synchronous Session while they return the coroutines with AsyncSession.
+    """
+
+    __slots__ = (
+        "_session",
+        "_raw_response",
+        "_async_mode",
+    )
+
+    _session: BaseSession
+    _raw_response: aiohttp.ClientResponse
+    _async_mode: bool
+
+    def __init__(
+        self,
+        session: BaseSession,
+        underlying_response: aiohttp.ClientResponse,
+        *,
+        async_mode: bool = False,
+        **kwargs,
+    ) -> None:
+        self._session = session
+        self._raw_response = underlying_response
+        self._async_mode = async_mode
+
+    @property
+    def session(self) -> BaseSession:
+        return self._session
+
+    @property
+    def status(self) -> int:
+        return self._raw_response.status
+
+    @property
+    def reason(self) -> str:
+        if self._raw_response.reason is not None:
+            return self._raw_response.reason
+        return ""
+
+    @property
+    def headers(self) -> Mapping[str, str]:
+        return self._raw_response.headers
+
+    @property
+    def raw_response(self) -> aiohttp.ClientResponse:
+        return self._raw_response
+
+    @property
+    def content_type(self) -> str:
+        return self._raw_response.content_type
+
+    @property
+    def content_length(self) -> Optional[int]:
+        return self._raw_response.content_length
+
+    @property
+    def content(self) -> aiohttp.StreamReader:
+        return self._raw_response.content
+
+
+class Response(AsyncResponseMixin, BaseResponse):
+    pass
+
+
+class FetchContextManager:
+    """
+    The context manager returned by :func:`Request.fetch`.
+
+    It provides asynchronous context manager interfaces only.
+    """
+
+    __slots__ = (
+        "session",
+        "rqst_ctx_builder",
+        "response_cls",
+        "check_status",
+        "_async_mode",
+        "_rqst_ctx",
+    )
+
+    _rqst_ctx: Optional[_RequestContextManager]
+
+    def __init__(
+        self,
+        session: BaseSession,
+        rqst_ctx_builder: Callable[[], _RequestContextManager],
+        *,
+        response_cls: Type[Response] = Response,
+        check_status: bool = True,
+    ) -> None:
+        self.session = session
+        self.rqst_ctx_builder = rqst_ctx_builder
+        self.check_status = check_status
+        self.response_cls = response_cls
+        self._async_mode = isinstance(session, AsyncSession)
+        self._rqst_ctx = None
+
+    async def __aenter__(self) -> Response:
+        max_retries = len(self.session.config.endpoints)
+        retry_count = 0
+        raw_resp: Optional[aiohttp.ClientResponse] = None
+        while True:
+            try:
+                retry_count += 1
+                self._rqst_ctx = self.rqst_ctx_builder()
+                assert self._rqst_ctx is not None
+                raw_resp = await self._rqst_ctx.__aenter__()
+                if self.check_status and raw_resp.status // 100 not in [2, 3]:
+                    msg = await raw_resp.text()
+                    await raw_resp.__aexit__(None, None, None)
+                    raise BackendAPIError(raw_resp.status, raw_resp.reason or "", msg)
+                return self.response_cls(self.session, raw_resp, async_mode=self._async_mode)
+            except aiohttp.ClientConnectionError as e:
+                if retry_count == max_retries:
+                    msg = (
+                        "Request to the API endpoint has failed.\n"
+                        "Check your network connection and/or the server status.\n"
+                        "\u279c {!r}".format(e)
+                    )
+                    raise BackendClientError(msg) from e
+                else:
+                    self.session.config.rotate_endpoints()
+                    continue
+            except aiohttp.ClientResponseError as e:
+                msg = "API endpoint response error.\n\u279c {!r}".format(e)
+                if raw_resp is not None:
+                    await raw_resp.__aexit__(*sys.exc_info())
+                raise BackendClientError(msg) from e
+            finally:
+                self.session.config.load_balance_endpoints()
+
+    async def __aexit__(self, *exc_info) -> Optional[bool]:
+        assert self._rqst_ctx is not None
+        await self._rqst_ctx.__aexit__(*exc_info)
+        self._rqst_ctx = None
+        return None
+
+
+class WebSocketResponse(BaseResponse):
+    """
+    A high-level wrapper of :class:`aiohttp.ClientWebSocketResponse`.
+    """
+
+    __slots__ = ("_raw_ws",)
+
+    def __init__(
+        self,
+        session: BaseSession,
+        underlying_response: aiohttp.ClientResponse,
+        **kwargs,
+    ) -> None:
+        super().__init__(session, underlying_response, **kwargs)
+        self._raw_ws = cast(aiohttp.ClientWebSocketResponse, underlying_response)
+
+    @property
+    def content_type(self) -> str:
+        raise AttributeError("WebSocketResponse does not have an explicit content type.")
+
+    @property
+    def content_length(self) -> Optional[int]:
+        raise AttributeError("WebSocketResponse does not have a fixed content length.")
+
+    @property
+    def content(self) -> aiohttp.StreamReader:
+        raise AttributeError("WebSocketResponse does not support reading the content.")
+
+    @property
+    def raw_websocket(self) -> aiohttp.ClientWebSocketResponse:
+        return self._raw_ws
+
+    @property
+    def closed(self) -> bool:
+        return self._raw_ws.closed
+
+    async def close(self) -> None:
+        await self._raw_ws.close()
+
+    def __aiter__(self) -> AsyncIterator[aiohttp.WSMessage]:
+        return self._raw_ws.__aiter__()
+
+    def exception(self) -> Optional[BaseException]:
+        return self._raw_ws.exception()
+
+    async def send_str(self, raw_str: str) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_str(raw_str)
+
+    async def send_json(self, obj: Any) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_json(obj)
+
+    async def send_bytes(self, data: bytes) -> None:
+        if self._raw_ws.closed:
+            raise aiohttp.ServerDisconnectedError("server disconnected")
+        await self._raw_ws.send_bytes(data)
+
+663

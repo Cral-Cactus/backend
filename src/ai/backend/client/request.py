@@ -221,22 +221,6 @@ class Request:
         return url
 
     def fetch(self, **kwargs) -> FetchContextManager:
-        """
-        Sends the request to the server and reads the response.
-
-        You may use this method with AsyncSession only,
-        following the pattern below:
-
-        .. code-block:: python3
-
-          from ai.backend.client.request import Request
-          from ai.backend.client.session import AsyncSession
-
-          async with AsyncSession() as sess:
-            rqst = Request('GET', ...)
-            async with rqst.fetch() as resp:
-              print(await resp.text())
-        """
         assert self.method in self._allowed_methods, "Disallowed HTTP method: {}".format(
             self.method
         )
@@ -556,5 +540,3 @@ class WebSocketResponse(BaseResponse):
         if self._raw_ws.closed:
             raise aiohttp.ServerDisconnectedError("server disconnected")
         await self._raw_ws.send_bytes(data)
-
-663

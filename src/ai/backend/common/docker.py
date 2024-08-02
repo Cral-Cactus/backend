@@ -272,47 +272,218 @@ async def get_registry_info(etcd: AsyncEtcd, name: str) -> tuple[yarl.URL, dict]
     return yarl.URL(registry_addr), creds
 
 
-def validate_image_labels(labels: dict[str, str]) -> dict[str, str]:
-    common_labels = common_image_label_schema.check(labels)
-    service_ports = {
-        item["name"]: item
-        for item in parse_service_ports(
-            common_labels.get("ai.backend.service-ports", ""),
-            common_labels.get("ai.backend.endpoint-ports", ""),
-        )
-    }
-    match common_labels["ai.backend.role"]:
-        case "INFERENCE":
-            inference_labels = inference_image_label_schema.check(labels)
-            for name in inference_labels["ai.backend.endpoint-ports"]:
-                if name not in service_ports:
-                    raise ValueError(
-                        f"ai.backend.endpoint-ports contains an undefined service port: {name}"
-                    )
-                if service_ports[name]["protocol"] != "preopen":
-                    raise ValueError(f"The endpoint-port {name} must be a preopen service-port.")
-            common_labels.update(inference_labels)
-        case _:
+    def has(self, key: str, version: str = None):
+        if version is None:
+            return key in self._data
+        _v = self._data.get(key, None)
+        return _v == version
+
+    def __getitem__(self, key: str):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __eq__(self, other):
+        if isinstance(other, (set, frozenset)):
+            return set(self._data.keys()) == other
+        return self._data == other
+
+
+class ImageRef:
+    _value: str
+    _is_local: bool
+    _arch: str
+    _registry: str
+
+    _name: str
+    _tag: str
+
+    __slots__ = ("_registry", "_name", "_tag", "_arch", "_tag_set", "_sha", "_is_local", "_value")
+
+    _rx_slug = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-._]*[A-Za-z0-9])?$")
+
+    def __init__(
+        self,
+        value: str,
+        known_registries: Optional[Mapping[str, Any] | Sequence[str]] = None,
+        architecture: str = "x86_64",
+        is_local: bool = False,
+    ) -> None:
+        self._value = value
+        self._is_local = is_local
+        self._arch = arch_name_aliases.get(architecture, architecture)
+        rx_slug = type(self)._rx_slug
+        if "://" in self._value or self._value.startswith("//"):
+            raise InvalidImageName(self._value)
+        parts = self._value.split("/", maxsplit=1)
+        if len(parts) == 1:
+            self._registry = default_registry
+            self._name, self._tag = ImageRef._parse_image_tag(self._value, True)
+            if not rx_slug.search(self._tag):
+                raise InvalidImageTag(self._tag, self._value)
+        else:
+            if is_known_registry(parts[0], known_registries):
+                self._registry = parts[0]
+                using_default = parts[0].endswith(".docker.io") or parts[0] == "docker.io"
+                self._name, self._tag = ImageRef._parse_image_tag(parts[1], using_default)
+            elif known_registries == ["*"]:
+                self._registry = parts[0]
+                self._name, self._tag = ImageRef._parse_image_tag(parts[1], False)
+            else:
+                self._registry = default_registry
+                self._name, self._tag = ImageRef._parse_image_tag(self._value, True)
+            if not rx_slug.search(self._tag):
+                raise InvalidImageTag(self._tag, self._value)
+        self._update_tag_set()
+
+    @staticmethod
+    def _parse_image_tag(s: str, using_default_registry: bool = False) -> tuple[str, str]:
+        image_tag = s.rsplit(":", maxsplit=1)
+        if len(image_tag) == 1:
+            image = image_tag[0]
+            tag = "latest"
+        else:
+            image = image_tag[0]
+            tag = image_tag[1]
+        if not image:
+            raise InvalidImageName("Empty image repository/name")
+        if ("/" not in image) and using_default_registry:
+            image = default_repository + "/" + image
+        return image, tag
+
+    def _update_tag_set(self):
+        if self._tag is None:
+            self._tag_set = (None, PlatformTagSet([], self._value))
+            return
+        tags = self._tag.split("-")
+        self._tag_set = (tags[0], PlatformTagSet(tags[1:], self._value))
+
+    def generate_aliases(self) -> Mapping[str, "ImageRef"]:
+        basename = self.name.split("/")[-1]
+        possible_names = basename.rsplit("-")
+        if len(possible_names) > 1:
+            possible_names = [basename, possible_names[1]]
+
+        possible_ptags = []
+        tag_set = self.tag_set
+        if not tag_set[0]:
             pass
-    return common_labels
+        else:
+            possible_ptags.append([tag_set[0]])
+            for tag_key in tag_set[1]:
+                tag_ver = tag_set[1][tag_key]
+                tag_list = ["", tag_key, tag_key + tag_ver]
+                if "." in tag_ver:
+                    tag_list.append(tag_key + tag_ver.rsplit(".")[0])
+                elif tag_key == "py" and len(tag_ver) > 1:
+                    tag_list.append(tag_key + tag_ver[0])
+                if "cuda" in tag_key:
+                    tag_list.append("gpu")
+                possible_ptags.append(tag_list)
 
+        ret = {}
+        for name in possible_names:
+            ret[name] = self
+        for name, ptags in itertools.product(possible_names, itertools.product(*possible_ptags)):
+            ret[f"{name}:{'-'.join(t for t in ptags if t)}"] = self
+        return ret
 
-class PlatformTagSet(Mapping):
-    __slots__ = ("_data",)
-    _data: dict[str, str]
-    _rx_ver = re.compile(r"^(?P<tag>[a-zA-Z_]+)(?P<version>\d+(?:\.\d+)*[a-z0-9]*)?$")
+    @staticmethod
+    def merge_aliases(genned_aliases_1, genned_aliases_2) -> Mapping[str, "ImageRef"]:
+        ret = {}
+        aliases_set_1, aliases_set_2 = set(genned_aliases_1.keys()), set(genned_aliases_2.keys())
+        aliases_dup = aliases_set_1 & aliases_set_2
 
-    def __init__(self, tags: Iterable[str], value: str = None) -> None:
-        self._data = dict()
-        rx = type(self)._rx_ver
-        for tag in tags:
-            match = rx.search(tag)
-            if match is None:
-                raise InvalidImageTag(tag, value)
-            key = match.group("tag")
-            value = match.group("version")
-            if key in self._data:
-                raise InvalidImageTag(tag, value)
-            if value is None:
-                value = ""
-            self._data[key] = value
+        for alias in aliases_dup:
+            ret[alias] = max(genned_aliases_1[alias], genned_aliases_2[alias])
+
+        for alias in aliases_set_1 - aliases_dup:
+            ret[alias] = genned_aliases_1[alias]
+        for alias in aliases_set_2 - aliases_dup:
+            ret[alias] = genned_aliases_2[alias]
+
+        return ret
+
+    @property
+    def canonical(self) -> str:
+        return f"{self.registry}/{self.name}:{self.tag}"
+
+    @property
+    def registry(self) -> str:
+        return self._registry
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def tag(self) -> str:
+        return self._tag
+
+    @property
+    def architecture(self) -> str:
+        return self._arch
+
+    @property
+    def tag_set(self) -> tuple[str, PlatformTagSet]:
+        return self._tag_set
+
+    @property
+    def is_local(self) -> bool:
+        return self._is_local
+
+    @property
+    def short(self) -> str:
+        return f"{self.name}:{self.tag}" if self.tag is not None else self.name
+
+    def __str__(self) -> str:
+        return self.canonical
+
+    def __repr__(self) -> str:
+        return f'<ImageRef: "{self.canonical}" ({self.architecture})>'
+
+    def __hash__(self) -> int:
+        return hash((self._name, self._tag, self._registry, self._arch))
+
+    def __eq__(self, other) -> bool:
+        return (
+            self._registry == other._registry
+            and self._name == other._name
+            and self._tag == other._tag
+            and self._arch == other._arch
+        )
+
+    def __ne__(self, other) -> bool:
+        return (
+            self._registry != other._registry
+            or self._name != other._name
+            or self._tag != other._tag
+            or self._arch != other._arch
+        )
+
+    def __lt__(self, other) -> bool:
+        if self == other:
+            return False
+        if self.name != other.name:
+            raise ValueError("only the image-refs with same names can be compared.")
+        if self.tag_set[0] != other.tag_set[0]:
+            return version.parse(self.tag_set[0]) < version.parse(other.tag_set[0])
+        ptagset_self, ptagset_other = self.tag_set[1], other.tag_set[1]
+        for key_self in ptagset_self:
+            if ptagset_other.has(key_self):
+                version_self, version_other = (
+                    ptagset_self.get(key_self),
+                    ptagset_other.get(key_self),
+                )
+                if version_self and version_other:
+                    parsed_version_self, parsed_version_other = (
+                        version.parse(version_self),
+                        version.parse(version_other),
+                    )
+                    if parsed_version_self != parsed_version_other:
+                        return parsed_version_self < parsed_version_other
+        return len(ptagset_self) > len(ptagset_other)

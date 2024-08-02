@@ -409,37 +409,3 @@ class AsyncSession(BaseSession):
             ssl = False
         connector = aiohttp.TCPConnector(ssl=ssl)
         self.aiohttp_session = aiohttp.ClientSession(connector=connector)
-
-    async def _aopen(self) -> None:
-        self._context_token = api_session.set(self)
-        if not self._proxy_mode:
-            self.api_version = await _negotiate_api_version(self.aiohttp_session, self.config)
-
-    def open(self) -> Awaitable[None]:
-        return self._aopen()
-
-    async def _aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        await _close_aiohttp_session(self.aiohttp_session)
-        api_session.reset(self._context_token)
-
-    def close(self) -> Awaitable[None]:
-        return self._aclose()
-
-    async def __aenter__(self) -> AsyncSession:
-        assert not self.closed, "Cannot reuse closed session"
-        await self.open()
-        if self.config.announcement_handler:
-            try:
-                payload = await self.Manager.get_announcement()
-                if payload["enabled"]:
-                    self.config.announcement_handler(payload["message"])
-            except (BackendClientError, BackendAPIError):
-                pass
-        return self
-
-    async def __aexit__(self, *exc_info) -> Literal[False]:
-        await self.close()
-        return False

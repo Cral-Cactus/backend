@@ -56,30 +56,3 @@ def get_cgroup_of_pid(controller: str, pid: PID) -> str:
         if id == controller_id:
             return cgroup.removeprefix("/")
     raise RuntimeError(f"could not find the cgroup of PID {pid}")
-
-
-def get_container_id_of_cgroup(cgroup: str) -> Optional[str]:
-    cgroupfs_prefix = "docker/"
-    if cgroup.startswith(cgroupfs_prefix):
-        return cgroup.removeprefix(cgroupfs_prefix)
-    systemd_prefix = "system.slice/docker-"
-    systemd_suffix = ".scope"
-    if cgroup.startswith(systemd_prefix) and cgroup.endswith(systemd_suffix):
-        return cgroup.removeprefix(systemd_prefix).removesuffix(systemd_suffix)
-    return None
-
-
-async def get_container_pids(cid: ContainerId) -> list[int]:
-    cgroup_version = await get_docker_cgroup_version()
-    log.debug("Cgroup version: {}, {}", cgroup_version.version, cgroup_version.driver)
-    match (cgroup_version.version, cgroup_version.driver):
-        case ("2", "systemd"):
-            tasks_path = Path(f"/sys/fs/cgroup/system.slice/docker-{cid}.scope/cgroup.procs")
-        case ("2", "cgroupfs"):
-            tasks_path = Path(f"/sys/fs/cgroup/docker/{cid}/cgroup.procs")
-        case ("1", _):
-            tasks_path = Path(f"/sys/fs/cgroup/pids/docker/{cid}/tasks")
-        case _:
-            raise RuntimeError("Should not reach here")
-    tasks = await asyncio.get_running_loop().run_in_executor(None, tasks_path.read_text)
-    return [*map(int, tasks.splitlines())]

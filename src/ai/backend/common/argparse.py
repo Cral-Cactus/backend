@@ -78,22 +78,3 @@ def host_port_pair(s: str) -> Tuple[ipaddress._BaseAddress, int]:
             msg = f"{pieces[1]!r} is not a valid port number."
             raise argparse.ArgumentTypeError(msg)
     return HostPortPair(host, port)
-
-
-def ipaddr(s: str) -> ipaddress._BaseAddress:
-    try:
-        ip = ipaddress.ip_address(s.strip("[]"))
-    except ValueError:
-        msg = f"{s!r} is not a valid IP address."
-        raise argparse.ArgumentTypeError(msg)
-    return ip
-
-
-def path(val: str) -> pathlib.Path:
-    if val is None:
-        return None
-    p = pathlib.Path(val)
-    if not p.exists():
-        msg = f"{val!r} is not a valid file/dir path."
-        raise argparse.ArgumentTypeError(msg)
-    return p

@@ -147,32 +147,58 @@ def find_config_file(daemon_name: str) -> Path:
                     f"Unsupported platform for config path auto-discovery: {sys.platform}"
                 ),
             })
-    else:
-        toml_paths = [Path(toml_path_from_env)]
-    for _path in toml_paths:
-        if _path.is_file():
-            return _path
-    else:
-        searched_paths = ",".join(map(str, toml_paths))
-        raise ConfigurationError({
-            "find_config_file()": f"Could not read config from: {searched_paths}",
-        })
-
-
-def read_from_file(
-    toml_path: Optional[Union[Path, str]], daemon_name: str
-) -> Tuple[Dict[str, Any], Path]:
+async def read_from_etcd(
+    etcd_config: Mapping[str, Any], scope_prefix_map: Mapping[ConfigScopes, str]
+) -> Optional[Dict[str, Any]]:
+    etcd = AsyncEtcd(etcd_config["addr"], etcd_config["namespace"], scope_prefix_map)
+    raw_value = await etcd.get("daemon/config")
+    if raw_value is None:
+        return None
     config: Dict[str, Any]
-    discovered_path: Path
-    if toml_path is None:
-        discovered_path = find_config_file(daemon_name)
-    else:
-        discovered_path = Path(toml_path)
+    config = cast(Dict[str, Any], tomli.loads(raw_value))
+    return config
+
+
+def override_key(table: MutableMapping[str, Any], key_path: Tuple[str, ...], value: Any):
+    for k in key_path[:-1]:
+        if k not in table:
+            table[k] = {}
+        table = table[k]
+    table[key_path[-1]] = value
+
+
+def override_with_env(table: MutableMapping[str, Any], key_path: Tuple[str, ...], env_key: str):
+    val = os.environ.get(env_key, None)
+    if val is None:
+        return
+    override_key(table, key_path, val)
+
+
+def check(table: Any, iv: t.Trafaret):
     try:
-        config = cast(Dict[str, Any], tomli.loads(discovered_path.read_text()))
-    except IOError:
-        raise ConfigurationError({
-            "read_from_file()": f"Could not read config from: {discovered_path}",
-        })
+        config = iv.check(table)
+    except t.DataError as e:
+        raise ConfigurationError(e.as_dict())
     else:
-        return config, discovered_path
+        return config
+
+
+def merge(table: Mapping[str, Any], updates: Mapping[str, Any]) -> Mapping[str, Any]:
+    result = {**table}
+    for k, v in updates.items():
+        if isinstance(v, Mapping):
+            orig = result.get(k, {})
+            assert isinstance(orig, Mapping)
+            result[k] = merge(orig, v)
+        else:
+            result[k] = v
+    return result
+
+
+def set_if_not_set(table: MutableMapping[str, Any], key_path: Tuple[str, ...], value: Any) -> None:
+    for k in key_path[:-1]:
+        if k not in table:
+            return
+        table = table[k]
+    if table.get(key_path[-1]) is None:
+        table[key_path[-1]] = value

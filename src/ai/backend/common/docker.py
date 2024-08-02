@@ -106,43 +106,213 @@ class DockerConnector:
 
 
 @functools.lru_cache()
-def get_docker_context_host() -> str | None:
-    try:
-        docker_config_path = Path.home() / ".docker" / "config.json"
-        docker_config = json.loads(docker_config_path.read_bytes())
-    except IOError:
-        return None
-    current_context_name = docker_config.get("currentContext", "default")
-    for meta_path in (Path.home() / ".docker" / "contexts" / "meta").glob("*/meta.json"):
-        context_data = json.loads(meta_path.read_bytes())
-        if context_data["Name"] == current_context_name:
-            return context_data["Endpoints"]["docker"]["Host"]
-    return None
-
-
-def parse_docker_host_url(
-    docker_host: yarl.URL,
-) -> tuple[Path | None, yarl.URL, aiohttp.BaseConnector]:
+def _search_docker_socket_files_impl() -> (
+    tuple[Path, yarl.URL, type[aiohttp.UnixConnector] | type[aiohttp.NamedPipeConnector]]
+):
     connector_cls: type[aiohttp.UnixConnector] | type[aiohttp.NamedPipeConnector]
-    match docker_host.scheme:
-        case "http" | "https":
-            return None, docker_host, aiohttp.TCPConnector()
-        case "unix":
-            path = Path(docker_host.path)
-            if not path.exists() or not path.is_socket():
-                raise RuntimeError(f"DOCKER_HOST {path} is not a valid socket file.")
-            decoded_path = os.fsdecode(path)
+    match sys.platform:
+        case "linux" | "darwin":
+            search_paths = [
+                Path("/run/docker.sock"),
+                Path("/var/run/docker.sock"),
+                Path.home() / ".docker/run/docker.sock",
+            ]
             connector_cls = aiohttp.UnixConnector
-        case "npipe":
-            path = Path(docker_host.path.replace("/", "\\"))
-            if not path.exists() or not path.is_fifo():
-                raise RuntimeError(f"DOCKER_HOST {path} is not a valid named pipe.")
-            decoded_path = os.fsdecode(path)
+        case "win32":
+            search_paths = [
+                Path(r"\\.\pipe\docker_engine"),
+            ]
             connector_cls = aiohttp.NamedPipeConnector
-        case _ as unknown_scheme:
-            raise RuntimeError("unsupported connection scheme", unknown_scheme)
+        case _ as platform_name:
+            raise RuntimeError(f"unsupported platform: {platform_name}")
+    for p in search_paths:
+        if p.exists() and (p.is_socket() or p.is_fifo()):
+            return (
+                p,
+                yarl.URL("http://docker"),
+                connector_cls,
+            )
+    else:
+        searched_paths = ", ".join(map(os.fsdecode, search_paths))
+        raise RuntimeError(f"could not find the docker socket; tried: {searched_paths}")
+
+
+def search_docker_socket_files() -> tuple[Path | None, yarl.URL, aiohttp.BaseConnector]:
+    connector_cls: type[aiohttp.UnixConnector] | type[aiohttp.NamedPipeConnector]
+    sock_path, docker_host, connector_cls = _search_docker_socket_files_impl()
     return (
-        path,
-        yarl.URL("http://docker"),
-        connector_cls(decoded_path, force_close=True),
+        sock_path,
+        docker_host,
+        connector_cls(os.fsdecode(sock_path), force_close=True),
     )
+
+
+def get_docker_connector() -> DockerConnector:
+    if raw_docker_host := os.environ.get("DOCKER_HOST", None):
+        sock_path, docker_host, connector = parse_docker_host_url(yarl.URL(raw_docker_host))
+        return DockerConnector(
+            sock_path,
+            docker_host,
+            connector,
+            DockerConnectorSource.ENV_VAR,
+        )
+    if raw_docker_host := get_docker_context_host():
+        sock_path, docker_host, connector = parse_docker_host_url(yarl.URL(raw_docker_host))
+        return DockerConnector(
+            sock_path,
+            docker_host,
+            connector,
+            DockerConnectorSource.USER_CONTEXT,
+        )
+    sock_path, docker_host, connector = search_docker_socket_files()
+    return DockerConnector(
+        sock_path,
+        docker_host,
+        connector,
+        DockerConnectorSource.KNOWN_LOCATION,
+    )
+
+
+async def login(
+    sess: aiohttp.ClientSession, registry_url: yarl.URL, credentials: dict, scope: str
+) -> dict:
+    basic_auth: Optional[aiohttp.BasicAuth]
+
+    if credentials.get("username") and credentials.get("password"):
+        basic_auth = aiohttp.BasicAuth(
+            credentials["username"],
+            credentials["password"],
+        )
+    else:
+        basic_auth = None
+    realm = registry_url / "token"  # fallback
+    service = "registry"  # fallback
+    async with sess.get(registry_url / "v2/", auth=basic_auth) as resp:
+        ping_status = resp.status
+        www_auth_header = resp.headers.get("WWW-Authenticate")
+        if www_auth_header:
+            match = re.search(r'realm="([^"]+)"', www_auth_header)
+            if match:
+                realm = yarl.URL(match.group(1))
+            match = re.search(r'service="([^"]+)"', www_auth_header)
+            if match:
+                service = match.group(1)
+    if ping_status == 200:
+        log.debug("docker-registry: {0} -> basic-auth", registry_url)
+        return {"auth": basic_auth, "headers": {}}
+    elif ping_status == 404:
+        raise RuntimeError(f"Unsupported docker registry: {registry_url}! (API v2 not implemented)")
+    elif ping_status == 401:
+        params = {
+            "scope": scope,
+            "offline_token": "true",
+            "client_id": "docker",
+            "service": service,
+        }
+        async with sess.get(realm, params=params, auth=basic_auth) as resp:
+            log.debug("docker-registry: {0} -> {1}", registry_url, realm)
+            if resp.status == 200:
+                data = json.loads(await resp.read())
+                token = data.get("token", None)
+                return {
+                    "auth": None,
+                    "headers": {
+                        "Authorization": f"Bearer {token}",
+                    },
+                }
+    raise RuntimeError(f"authentication for docker registry {registry_url} failed")
+
+
+async def get_known_registries(etcd: AsyncEtcd) -> Mapping[str, yarl.URL]:
+    data = await etcd.get_prefix("config/docker/registry/")
+    results: MutableMapping[str, yarl.URL] = {}
+    for key, value in data.items():
+        name = etcd_unquote(key)
+        if isinstance(value, str):
+            results[name] = yarl.URL(value)
+        elif isinstance(value, Mapping):
+            assert isinstance(value[""], str)
+            results[name] = yarl.URL(value[""])
+    return results
+
+
+def is_known_registry(
+    val: str,
+    known_registries: Union[Mapping[str, Any], Sequence[str]] | None = None,
+):
+    if val == default_registry:
+        return True
+    if known_registries is not None and val in known_registries:
+        return True
+    try:
+        url = yarl.URL("//" + val)
+        if url.host and ipaddress.ip_address(url.host):
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+async def get_registry_info(etcd: AsyncEtcd, name: str) -> tuple[yarl.URL, dict]:
+    reg_path = f"config/docker/registry/{etcd_quote(name)}"
+    item = await etcd.get_prefix(reg_path)
+    if not item:
+        raise UnknownImageRegistry(name)
+    registry_addr = item[""]
+    if not registry_addr:
+        raise UnknownImageRegistry(name)
+    assert isinstance(registry_addr, str)
+    creds = {}
+    username = item.get("username")
+    if username is not None:
+        creds["username"] = username
+    password = item.get("password")
+    if password is not None:
+        creds["password"] = password
+    return yarl.URL(registry_addr), creds
+
+
+def validate_image_labels(labels: dict[str, str]) -> dict[str, str]:
+    common_labels = common_image_label_schema.check(labels)
+    service_ports = {
+        item["name"]: item
+        for item in parse_service_ports(
+            common_labels.get("ai.backend.service-ports", ""),
+            common_labels.get("ai.backend.endpoint-ports", ""),
+        )
+    }
+    match common_labels["ai.backend.role"]:
+        case "INFERENCE":
+            inference_labels = inference_image_label_schema.check(labels)
+            for name in inference_labels["ai.backend.endpoint-ports"]:
+                if name not in service_ports:
+                    raise ValueError(
+                        f"ai.backend.endpoint-ports contains an undefined service port: {name}"
+                    )
+                if service_ports[name]["protocol"] != "preopen":
+                    raise ValueError(f"The endpoint-port {name} must be a preopen service-port.")
+            common_labels.update(inference_labels)
+        case _:
+            pass
+    return common_labels
+
+
+class PlatformTagSet(Mapping):
+    __slots__ = ("_data",)
+    _data: dict[str, str]
+    _rx_ver = re.compile(r"^(?P<tag>[a-zA-Z_]+)(?P<version>\d+(?:\.\d+)*[a-z0-9]*)?$")
+
+    def __init__(self, tags: Iterable[str], value: str = None) -> None:
+        self._data = dict()
+        rx = type(self)._rx_ver
+        for tag in tags:
+            match = rx.search(tag)
+            if match is None:
+                raise InvalidImageTag(tag, value)
+            key = match.group("tag")
+            value = match.group("version")
+            if key in self._data:
+                raise InvalidImageTag(tag, value)
+            if value is None:
+                value = ""
+            self._data[key] = value

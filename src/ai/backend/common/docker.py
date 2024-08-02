@@ -456,34 +456,3 @@ class ImageRef:
             and self._tag == other._tag
             and self._arch == other._arch
         )
-
-    def __ne__(self, other) -> bool:
-        return (
-            self._registry != other._registry
-            or self._name != other._name
-            or self._tag != other._tag
-            or self._arch != other._arch
-        )
-
-    def __lt__(self, other) -> bool:
-        if self == other:
-            return False
-        if self.name != other.name:
-            raise ValueError("only the image-refs with same names can be compared.")
-        if self.tag_set[0] != other.tag_set[0]:
-            return version.parse(self.tag_set[0]) < version.parse(other.tag_set[0])
-        ptagset_self, ptagset_other = self.tag_set[1], other.tag_set[1]
-        for key_self in ptagset_self:
-            if ptagset_other.has(key_self):
-                version_self, version_other = (
-                    ptagset_self.get(key_self),
-                    ptagset_other.get(key_self),
-                )
-                if version_self and version_other:
-                    parsed_version_self, parsed_version_other = (
-                        version.parse(version_self),
-                        version.parse(version_other),
-                    )
-                    if parsed_version_self != parsed_version_other:
-                        return parsed_version_self < parsed_version_other
-        return len(ptagset_self) > len(ptagset_other)

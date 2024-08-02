@@ -216,48 +216,230 @@ class _SyncWorkerThread(threading.Thread):
         finally:
             del ctx
 
-    def interrupt_generator(self):
-        self.agen_shutdown = True
-        self.stream_block.set()
-        self.stream_queue.put(sentinel)
+        aiohttp_session: aiohttp.ClientSession
+    api_version: Tuple[int, str]
+
+    _closed: bool
+    _config: APIConfig
+    _proxy_mode: bool
+
+    def __init__(
+        self,
+        *,
+        config: APIConfig = None,
+        proxy_mode: bool = False,
+    ) -> None:
+        self._closed = False
+        self._config = config if config else get_config()
+        self._proxy_mode = proxy_mode
+        self.api_version = parse_api_version(self._config.version)
+
+        from .func.acl import Permission
+        from .func.admin import Admin
+        from .func.agent import Agent, AgentWatcher
+        from .func.auth import Auth
+        from .func.bgtask import BackgroundTask
+        from .func.domain import Domain
+        from .func.dotfile import Dotfile
+        from .func.etcd import EtcdConfig
+        from .func.group import Group
+        from .func.image import Image
+        from .func.keypair import KeyPair
+        from .func.keypair_resource_policy import KeypairResourcePolicy
+        from .func.manager import Manager
+        from .func.model import Model
+        from .func.quota_scope import QuotaScope
+        from .func.resource import Resource
+        from .func.scaling_group import ScalingGroup
+        from .func.server_log import ServerLog
+        from .func.service import Service
+        from .func.session import ComputeSession
+        from .func.session_template import SessionTemplate
+        from .func.storage import Storage
+        from .func.system import System
+        from .func.user import User
+        from .func.vfolder import VFolder
+
+        self.System = System
+        self.Admin = Admin
+        self.Agent = Agent
+        self.AgentWatcher = AgentWatcher
+        self.Storage = Storage
+        self.Auth = Auth
+        self.BackgroundTask = BackgroundTask
+        self.EtcdConfig = EtcdConfig
+        self.Domain = Domain
+        self.Group = Group
+        self.Image = Image
+        self.ComputeSession = ComputeSession
+        self.KeyPair = KeyPair
+        self.Manager = Manager
+        self.Resource = Resource
+        self.KeypairResourcePolicy = KeypairResourcePolicy
+        self.User = User
+        self.ScalingGroup = ScalingGroup
+        self.SessionTemplate = SessionTemplate
+        self.VFolder = VFolder
+        self.Dotfile = Dotfile
+        self.ServerLog = ServerLog
+        self.Permission = Permission
+        self.Service = Service
+        self.Model = Model
+        self.QuotaScope = QuotaScope
+
+    @property
+    def proxy_mode(self) -> bool:
+        """
+        If set True, it skips API version negotiation when opening the session.
+        """
+        return self._proxy_mode
+
+    @abc.abstractmethod
+    def open(self) -> Union[None, Awaitable[None]]:
+        """
+        Initializes the session and perform version negotiation.
+        """
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    def close(self) -> Union[None, Awaitable[None]]:
+        """
+        Terminates the session and releases underlying resources.
+        """
+        raise NotImplementedError
+
+    @property
+    def closed(self) -> bool:
+        """
+        Checks if the session is closed.
+        """
+        return self._closed
+
+    @property
+    def config(self) -> APIConfig:
+        """
+        The configuration used by this session object.
+        """
+        return self._config
+
+    def __enter__(self) -> BaseSession:
+        raise NotImplementedError
+
+    def __exit__(self, *exc_info) -> Literal[False]:
+        return False
+
+    async def __aenter__(self) -> BaseSession:
+        raise NotImplementedError
+
+    async def __aexit__(self, *exc_info) -> Literal[False]:
+        return False
 
 
-class BaseSession(metaclass=abc.ABCMeta):
-    """
-    The base abstract class for sessions.
-    """
+class Session(BaseSession):
 
-    __slots__ = (
-        "_config",
-        "_closed",
-        "_context_token",
-        "_proxy_mode",
-        "aiohttp_session",
-        "api_version",
-        "System",
-        "Manager",
-        "Admin",
-        "Agent",
-        "AgentWatcher",
-        "ScalingGroup",
-        "Storage",
-        "Image",
-        "ComputeSession",
-        "SessionTemplate",
-        "Domain",
-        "Group",
-        "Auth",
-        "User",
-        "KeyPair",
-        "BackgroundTask",
-        "EtcdConfig",
-        "Resource",
-        "KeypairResourcePolicy",
-        "VFolder",
-        "Dotfile",
-        "ServerLog",
-        "Permission",
-        "Service",
-        "Model",
-        "QuotaScope",
-    )
+    __slots__ = ("_worker_thread",)
+
+    def __init__(
+        self,
+        *,
+        config: APIConfig = None,
+        proxy_mode: bool = False,
+    ) -> None:
+        super().__init__(config=config, proxy_mode=proxy_mode)
+        self._worker_thread = _SyncWorkerThread()
+        self._worker_thread.start()
+
+        async def _create_aiohttp_session() -> aiohttp.ClientSession:
+            ssl: SSLContextType = True
+            if self._config.skip_sslcert_validation:
+                ssl = False
+            connector = aiohttp.TCPConnector(ssl=ssl)
+            return aiohttp.ClientSession(connector=connector)
+
+        self.aiohttp_session = self.worker_thread.execute(_create_aiohttp_session())
+
+    def open(self) -> None:
+        self._context_token = api_session.set(self)
+        if not self._proxy_mode:
+            self.api_version = self.worker_thread.execute(
+                _negotiate_api_version(self.aiohttp_session, self.config)
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._worker_thread.interrupt_generator()
+        self._worker_thread.execute(_close_aiohttp_session(self.aiohttp_session))
+        self._worker_thread.work_queue.put(sentinel)
+        self._worker_thread.join()
+        api_session.reset(self._context_token)
+
+    @property
+    def worker_thread(self):
+        return self._worker_thread
+
+    def __enter__(self) -> Session:
+        assert not self.closed, "Cannot reuse closed session"
+        self.open()
+        if self.config.announcement_handler:
+            try:
+                payload = self.Manager.get_announcement()
+                if payload["enabled"]:
+                    self.config.announcement_handler(payload["message"])
+            except (BackendClientError, BackendAPIError):
+                pass
+        return self
+
+    def __exit__(self, *exc_info) -> Literal[False]:
+        self.close()
+        return False  # raise up the inner exception
+
+
+class AsyncSession(BaseSession):
+    def __init__(
+        self,
+        *,
+        config: APIConfig = None,
+        proxy_mode: bool = False,
+    ) -> None:
+        super().__init__(config=config, proxy_mode=proxy_mode)
+        ssl: SSLContextType = True
+        if self._config.skip_sslcert_validation:
+            ssl = False
+        connector = aiohttp.TCPConnector(ssl=ssl)
+        self.aiohttp_session = aiohttp.ClientSession(connector=connector)
+
+    async def _aopen(self) -> None:
+        self._context_token = api_session.set(self)
+        if not self._proxy_mode:
+            self.api_version = await _negotiate_api_version(self.aiohttp_session, self.config)
+
+    def open(self) -> Awaitable[None]:
+        return self._aopen()
+
+    async def _aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await _close_aiohttp_session(self.aiohttp_session)
+        api_session.reset(self._context_token)
+
+    def close(self) -> Awaitable[None]:
+        return self._aclose()
+
+    async def __aenter__(self) -> AsyncSession:
+        assert not self.closed, "Cannot reuse closed session"
+        await self.open()
+        if self.config.announcement_handler:
+            try:
+                payload = await self.Manager.get_announcement()
+                if payload["enabled"]:
+                    self.config.announcement_handler(payload["message"])
+            except (BackendClientError, BackendAPIError):
+                pass
+        return self
+
+    async def __aexit__(self, *exc_info) -> Literal[False]:
+        await self.close()
+        return False

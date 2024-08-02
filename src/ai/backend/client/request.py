@@ -488,50 +488,6 @@ class WebSocketResponse(BaseResponse):
         super().__init__(session, underlying_response, **kwargs)
         self._raw_ws = cast(aiohttp.ClientWebSocketResponse, underlying_response)
 
-    @property
-    def content_type(self) -> str:
-        raise AttributeError("WebSocketResponse does not have an explicit content type.")
-
-    @property
-    def content_length(self) -> Optional[int]:
-        raise AttributeError("WebSocketResponse does not have a fixed content length.")
-
-    @property
-    def content(self) -> aiohttp.StreamReader:
-        raise AttributeError("WebSocketResponse does not support reading the content.")
-
-    @property
-    def raw_websocket(self) -> aiohttp.ClientWebSocketResponse:
-        return self._raw_ws
-
-    @property
-    def closed(self) -> bool:
-        return self._raw_ws.closed
-
-    async def close(self) -> None:
-        await self._raw_ws.close()
-
-    def __aiter__(self) -> AsyncIterator[aiohttp.WSMessage]:
-        return self._raw_ws.__aiter__()
-
-    def exception(self) -> Optional[BaseException]:
-        return self._raw_ws.exception()
-
-    async def send_str(self, raw_str: str) -> None:
-        if self._raw_ws.closed:
-            raise aiohttp.ServerDisconnectedError("server disconnected")
-        await self._raw_ws.send_str(raw_str)
-
-    async def send_json(self, obj: Any) -> None:
-        if self._raw_ws.closed:
-            raise aiohttp.ServerDisconnectedError("server disconnected")
-        await self._raw_ws.send_json(obj)
-
-    async def send_bytes(self, data: bytes) -> None:
-        if self._raw_ws.closed:
-            raise aiohttp.ServerDisconnectedError("server disconnected")
-        await self._raw_ws.send_bytes(data)
-
         @property
     def closed(self) -> bool:
         return self._raw_ws.closed

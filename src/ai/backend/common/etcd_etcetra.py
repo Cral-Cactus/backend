@@ -112,28 +112,212 @@ class AsyncEtcd:
         else:
             self._creds = None
 
-        self.ns = namespace
-        log.info('using etcd cluster from {} with namespace "{}"', addr, namespace)
-        self.encoding = encoding
-        self.watch_reconnect_intvl = watch_reconnect_intvl
-        self.etcd = EtcdClient(
-            EtcetraHostPortPair(str(addr.host), addr.port),
-            credentials=self._creds,
-            encoding=self.encoding,
-        )
+        def _merge_scope_prefix_map(
+        self,
+        override: Mapping[ConfigScopes, str] = None,
+    ) -> Mapping[ConfigScopes, str]:
 
-    async def close(self):
-        pass
+        return ChainMap(cast(MutableMapping, override) or {}, self.scope_prefix_map)
 
-    def _mangle_key(self, k: str) -> str:
-        if k.startswith("/"):
-            k = k[1:]
-        return f"/sorna/{self.ns}/{k}"
+    async def put(
+        self,
+        key: str,
+        val: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
 
-    def _demangle_key(self, k: Union[bytes, str]) -> str:
-        if isinstance(k, bytes):
-            k = k.decode(self.encoding)
-        prefix = f"/sorna/{self.ns}/"
-        if k.startswith(prefix):
-            k = k[len(prefix) :]
-        return k
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        mangled_key = self._mangle_key(f"{_slash(scope_prefix)}{key}")
+        async with self.etcd.connect() as communicator:
+            await communicator.put(mangled_key, str(val))
+
+    async def put_prefix(
+        self,
+        key: str,
+        dict_obj: NestedStrKeyedMapping,
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
+
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        flattened_dict: NestedStrKeyedDict = {}
+
+        def _flatten(prefix: str, inner_dict: NestedStrKeyedDict) -> None:
+            for k, v in inner_dict.items():
+                if k == "":
+                    flattened_key = prefix
+                else:
+                    flattened_key = prefix + "/" + quote(k)
+                if isinstance(v, dict):
+                    _flatten(flattened_key, v)
+                else:
+                    flattened_dict[flattened_key] = v
+
+        _flatten(key, cast(NestedStrKeyedDict, dict_obj))
+
+        def _txn(action: EtcdTransactionAction):
+            for k, v in flattened_dict.items():
+                action.put(self._mangle_key(f"{_slash(scope_prefix)}{k}"), str(v))
+
+        async with self.etcd.connect() as communicator:
+            await communicator.txn(_txn)
+
+    async def put_dict(
+        self,
+        flattened_dict_obj: Mapping[str, str],
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
+
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+
+        def _pipe(txn: EtcdTransactionAction):
+            for k, v in flattened_dict_obj.items():
+                txn.put(self._mangle_key(f"{_slash(scope_prefix)}{k}"), str(v))
+
+        async with self.etcd.connect() as communicator:
+            await communicator.txn(_pipe)
+
+    async def get(
+        self,
+        key: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.MERGED,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ) -> Optional[str]:
+
+        _scope_prefix_map = self._merge_scope_prefix_map(scope_prefix_map)
+        if scope == ConfigScopes.MERGED or scope == ConfigScopes.NODE:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+            p = _scope_prefix_map.get(ConfigScopes.SGROUP)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+            p = _scope_prefix_map.get(ConfigScopes.NODE)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+        elif scope == ConfigScopes.SGROUP:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+            p = _scope_prefix_map.get(ConfigScopes.SGROUP)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+        elif scope == ConfigScopes.GLOBAL:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+        else:
+            raise ValueError("Invalid scope prefix value")
+
+        async with self.etcd.connect() as communicator:
+            for scope_prefix in scope_prefixes:
+                value = await communicator.get(self._mangle_key(f"{_slash(scope_prefix)}{key}"))
+                if value is not None:
+                    return value
+        return None
+
+    async def get_prefix(
+        self,
+        key_prefix: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.MERGED,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ) -> GetPrefixValue:
+
+        _scope_prefix_map = self._merge_scope_prefix_map(scope_prefix_map)
+        if scope == ConfigScopes.MERGED or scope == ConfigScopes.NODE:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+            p = _scope_prefix_map.get(ConfigScopes.SGROUP)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+            p = _scope_prefix_map.get(ConfigScopes.NODE)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+        elif scope == ConfigScopes.SGROUP:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+            p = _scope_prefix_map.get(ConfigScopes.SGROUP)
+            if p is not None:
+                scope_prefixes.insert(0, p)
+        elif scope == ConfigScopes.GLOBAL:
+            scope_prefixes = [_scope_prefix_map[ConfigScopes.GLOBAL]]
+        else:
+            raise ValueError("Invalid scope prefix value")
+        pair_sets: List[List[Mapping | Tuple]] = []
+        async with self.etcd.connect() as communicator:
+            for scope_prefix in scope_prefixes:
+                mangled_key_prefix = self._mangle_key(f"{_slash(scope_prefix)}{key_prefix}")
+                values = await communicator.get_prefix(mangled_key_prefix)
+                pair_sets.append([(self._demangle_key(k), v) for k, v in values.items()])
+
+        configs = [
+            make_dict_from_pairs(f"{_slash(scope_prefix)}{key_prefix}", pairs, "/")
+            for scope_prefix, pairs in zip(scope_prefixes, pair_sets)
+        ]
+        return ChainMap(*configs)
+
+    # for legacy
+    get_prefix_dict = get_prefix
+
+    async def replace(
+        self,
+        key: str,
+        initial_val: str,
+        new_val: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ) -> bool:
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        mangled_key = self._mangle_key(f"{_slash(scope_prefix)}{key}")
+
+        def _txn(success: EtcdTransactionAction, _):
+            success.put(mangled_key, new_val)
+
+        async with self.etcd.connect() as communicator:
+            _, success = await communicator.txn_compare(
+                [
+                    CompareKey(mangled_key).value == initial_val,
+                ],
+                _txn,
+            )
+            return success
+
+    async def delete(
+        self,
+        key: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        mangled_key = self._mangle_key(f"{_slash(scope_prefix)}{key}")
+        async with self.etcd.connect() as communicator:
+            await communicator.delete(mangled_key)
+
+        async def delete_multi(
+        self,
+        keys: Iterable[str],
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        async with self.etcd.connect() as communicator:
+
+            def _txn(action: EtcdTransactionAction):
+                for k in keys:
+                    action.delete(self._mangle_key(f"{_slash(scope_prefix)}{k}"))
+
+            await communicator.txn(_txn)
+
+    async def delete_prefix(
+        self,
+        key_prefix: str,
+        *,
+        scope: ConfigScopes = ConfigScopes.GLOBAL,
+        scope_prefix_map: Mapping[ConfigScopes, str] = None,
+    ):
+        scope_prefix = self._merge_scope_prefix_map(scope_prefix_map)[scope]
+        mangled_key_prefix = self._mangle_key(f"{_slash(scope_prefix)}{key_prefix}")
+        async with self.etcd.connect() as communicator:
+            await communicator.delete_prefix(mangled_key_prefix)

@@ -541,29 +541,22 @@ class BgtaskFailedEvent(BgtaskDoneEventArgs, AbstractEvent):
 
 
 @attrs.define(slots=True)
-class DoVolumeMountEvent(AbstractEvent):
-    name = "do_volume_mount"
+class DoVolumeUnmountEvent(AbstractEvent):
+    name = "do_volume_unmount"
 
     dir_name: str = attrs.field()
     volume_backend_name: str = attrs.field()
     quota_scope_id: QuotaScopeID = attrs.field()
-
-    fs_location: str = attrs.field()
-    fs_type: str = attrs.field(default="nfs")
-    cmd_options: str | None = attrs.field(default=None)
     scaling_group: str | None = attrs.field(default=None)
 
     edit_fstab: bool = attrs.field(default=False)
-    fstab_path: str = attrs.field(default="/etc/fstab")
+    fstab_path: str | None = attrs.field(default=None)
 
     def serialize(self) -> tuple:
         return (
             self.dir_name,
             self.volume_backend_name,
             str(self.quota_scope_id),
-            self.fs_location,
-            self.fs_type,
-            self.cmd_options,
             self.scaling_group,
             self.edit_fstab,
             self.fstab_path,
@@ -575,10 +568,200 @@ class DoVolumeMountEvent(AbstractEvent):
             dir_name=value[0],
             volume_backend_name=value[1],
             quota_scope_id=QuotaScopeID.parse(value[2]),
-            fs_location=value[3],
-            fs_type=value[4],
-            cmd_options=value[5],
-            scaling_group=value[6],
-            edit_fstab=value[7],
-            fstab_path=value[8],
+            scaling_group=value[3],
+            edit_fstab=value[4],
+            fstab_path=value[5],
         )
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class VolumeMountEventArgs(AbstractEvent):
+    node_id: str = attrs.field()
+    node_type: VolumeMountableNodeType = attrs.field()
+    mount_path: str = attrs.field()
+    quota_scope_id: QuotaScopeID = attrs.field()
+    err_msg: str | None = attrs.field(default=None)
+
+    def serialize(self) -> tuple:
+        return (
+            self.node_id,
+            str(self.node_type),
+            self.mount_path,
+            str(self.quota_scope_id),
+            self.err_msg,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            value[0],
+            VolumeMountableNodeType(value[1]),
+            value[2],
+            QuotaScopeID.parse(value[3]),
+            value[4],
+        )
+
+
+class VolumeMounted(VolumeMountEventArgs, AbstractEvent):
+    name = "volume_mounted"
+
+
+class VolumeUnmounted(VolumeMountEventArgs, AbstractEvent):
+    name = "volume_unmounted"
+
+
+class RedisConnectorFunc(Protocol):
+    def __call__(
+        self,
+    ) -> ConnectionPool: ...
+
+
+TEvent = TypeVar("TEvent", bound="AbstractEvent")
+TEventCov = TypeVar("TEventCov", bound="AbstractEvent")
+TContext = TypeVar("TContext")
+
+EventCallback = Union[
+    Callable[[TContext, AgentId, TEvent], Coroutine[Any, Any, None]],
+    Callable[[TContext, AgentId, TEvent], None],
+]
+
+
+@attrs.define(auto_attribs=True, slots=True, frozen=True, eq=False, order=False)
+class EventHandler(Generic[TContext, TEvent]):
+    event_cls: Type[TEvent]
+    name: str
+    context: TContext
+    callback: EventCallback[TContext, TEvent]
+    coalescing_opts: Optional[CoalescingOptions]
+    coalescing_state: CoalescingState
+    args_matcher: Callable[[tuple], bool] | None
+
+
+class CoalescingOptions(TypedDict):
+    max_wait: float
+    max_batch_size: int
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class CoalescingState:
+    batch_size: int = 0
+    last_added: float = 0.0
+    last_handle: asyncio.TimerHandle | None = None
+    fut_sync: asyncio.Future | None = None
+
+    def proceed(self):
+        if self.fut_sync is not None and not self.fut_sync.done():
+            self.fut_sync.set_result(None)
+
+    async def rate_control(self, opts: CoalescingOptions | None) -> bool:
+        if opts is None:
+            return True
+        loop = asyncio.get_running_loop()
+        if self.fut_sync is None:
+            self.fut_sync = loop.create_future()
+        assert self.fut_sync is not None
+        self.last_added = loop.time()
+        self.batch_size += 1
+        if self.batch_size >= opts["max_batch_size"]:
+            assert self.last_handle is not None
+            self.last_handle.cancel()
+            self.fut_sync.cancel()
+            self.last_handle = None
+            self.last_added = 0.0
+            self.batch_size = 0
+            return True
+        self.last_handle = loop.call_later(
+            opts["max_wait"],
+            self.proceed,
+        )
+        if self.last_added > 0 and loop.time() - self.last_added < opts["max_wait"]:
+            self.last_handle.cancel()
+            self.fut_sync.cancel()
+            self.fut_sync = loop.create_future()
+            self.last_handle = loop.call_later(
+                opts["max_wait"],
+                self.proceed,
+            )
+        try:
+            await self.fut_sync
+        except asyncio.CancelledError:
+            if self.last_handle is not None and not self.last_handle.cancelled():
+                self.last_handle.cancel()
+            return False
+        else:
+            self.fut_sync = None
+            self.last_handle = None
+            self.last_added = 0.0
+            self.batch_size = 0
+            return True
+
+
+class EventDispatcher(aobject):
+
+    consumers: defaultdict[str, set[EventHandler[Any, AbstractEvent]]]
+    subscribers: defaultdict[str, set[EventHandler[Any, AbstractEvent]]]
+    redis_client: RedisConnectionInfo
+    consumer_loop_task: asyncio.Task
+    subscriber_loop_task: asyncio.Task
+    consumer_taskgroup: PersistentTaskGroup
+    subscriber_taskgroup: PersistentTaskGroup
+
+    _log_events: bool
+    _consumer_name: str
+
+    def __init__(
+        self,
+        redis_config: EtcdRedisConfig,
+        db: int = 0,
+        log_events: bool = False,
+        *,
+        consumer_group: str,
+        service_name: str | None = None,
+        stream_key: str = "events",
+        node_id: str | None = None,
+        consumer_exception_handler: AsyncExceptionHandler | None = None,
+        subscriber_exception_handler: AsyncExceptionHandler | None = None,
+    ) -> None:
+        _redis_config = redis_config.copy()
+        if service_name:
+            _redis_config["service_name"] = service_name
+        self.redis_client = redis_helper.get_redis_object(
+            _redis_config, name="event_dispatcher.stream", db=db
+        )
+        self._log_events = log_events
+        self._closed = False
+        self.consumers = defaultdict(set)
+        self.subscribers = defaultdict(set)
+        self._stream_key = stream_key
+        self._consumer_group = consumer_group
+        self._consumer_name = _generate_consumer_id(node_id)
+        self.consumer_taskgroup = PersistentTaskGroup(
+            name="consumer_taskgroup",
+            exception_handler=consumer_exception_handler,
+        )
+        self.subscriber_taskgroup = PersistentTaskGroup(
+            name="subscriber_taskgroup",
+            exception_handler=subscriber_exception_handler,
+        )
+
+    async def __ainit__(self) -> None:
+        self.consumer_loop_task = asyncio.create_task(self._consume_loop())
+        self.subscriber_loop_task = asyncio.create_task(self._subscribe_loop())
+
+    async def close(self) -> None:
+        self._closed = True
+        try:
+            cancelled_tasks = []
+            await self.consumer_taskgroup.shutdown()
+            await self.subscriber_taskgroup.shutdown()
+            if not self.consumer_loop_task.done():
+                self.consumer_loop_task.cancel()
+                cancelled_tasks.append(self.consumer_loop_task)
+            if not self.subscriber_loop_task.done():
+                self.subscriber_loop_task.cancel()
+                cancelled_tasks.append(self.subscriber_loop_task)
+            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
+        except Exception:
+            log.exception("unexpected error while closing event dispatcher")
+        finally:
+            await self.redis_client.close()

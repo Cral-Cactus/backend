@@ -904,32 +904,3 @@ class EventProducer(aobject):
     async def close(self) -> None:
         self._closed = True
         await self.redis_client.close()
-
-    async def produce_event(
-        self,
-        event: AbstractEvent,
-        *,
-        source: str = "manager",
-    ) -> None:
-        if self._closed:
-            return
-        raw_event = {
-            b"name": event.name.encode(),
-            b"source": source.encode(),
-            b"args": msgpack.packb(event.serialize()),
-        }
-        await redis_helper.execute(
-            self.redis_client,
-            lambda r: r.xadd(self._stream_key, raw_event),
-        )
-
-
-def _generate_consumer_id(node_id: str | None = None) -> str:
-    h = hashlib.sha1()
-    h.update(str(node_id or socket.getfqdn()).encode("utf8"))
-    hostname_hash = h.hexdigest()
-    h = hashlib.sha1()
-    h.update(__file__.encode("utf8"))
-    installation_path_hash = h.hexdigest()
-    pidx = process_index.get(0)
-    return f"{hostname_hash}:{installation_path_hash}:{pidx}"

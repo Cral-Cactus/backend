@@ -709,59 +709,227 @@ class EventDispatcher(aobject):
     _log_events: bool
     _consumer_name: str
 
+        def consume(
+        self,
+        event_cls: Type[TEvent],
+        context: TContext,
+        callback: EventCallback[TContext, TEvent],
+        coalescing_opts: CoalescingOptions = None,
+        *,
+        name: str | None = None,
+        args_matcher: Callable[[tuple], bool] | None = None,
+    ) -> EventHandler[TContext, TEvent]:
+
+        if name is None:
+            name = f"evh-{secrets.token_urlsafe(16)}"
+        handler = EventHandler(
+            event_cls,
+            name,
+            context,
+            callback,
+            coalescing_opts,
+            CoalescingState(),
+            args_matcher,
+        )
+        self.consumers[event_cls.name].add(cast(EventHandler[Any, AbstractEvent], handler))
+        return handler
+
+    def unconsume(
+        self,
+        handler: EventHandler[TContext, TEvent],
+    ) -> None:
+        self.consumers[handler.event_cls.name].discard(
+            cast(EventHandler[Any, AbstractEvent], handler)
+        )
+
+    def subscribe(
+        self,
+        event_cls: Type[TEvent],
+        context: TContext,
+        callback: EventCallback[TContext, TEvent],
+        coalescing_opts: CoalescingOptions | None = None,
+        *,
+        name: str | None = None,
+        args_matcher: Callable[[tuple], bool] | None = None,
+    ) -> EventHandler[TContext, TEvent]:
+
+        if name is None:
+            name = f"evh-{secrets.token_urlsafe(16)}"
+        handler = EventHandler(
+            event_cls,
+            name,
+            context,
+            callback,
+            coalescing_opts,
+            CoalescingState(),
+            args_matcher,
+        )
+        self.subscribers[event_cls.name].add(cast(EventHandler[Any, AbstractEvent], handler))
+        return handler
+
+    def unsubscribe(
+        self,
+        handler: EventHandler[TContext, TEvent],
+    ) -> None:
+        self.subscribers[handler.event_cls.name].discard(
+            cast(EventHandler[Any, AbstractEvent], handler)
+        )
+
+    async def handle(self, evh_type: str, evh: EventHandler, source: AgentId, args: tuple) -> None:
+        if evh.args_matcher and not evh.args_matcher(args):
+            return
+        coalescing_opts = evh.coalescing_opts
+        coalescing_state = evh.coalescing_state
+        cb = evh.callback
+        event_cls = evh.event_cls
+        if self._closed:
+            return
+        if await coalescing_state.rate_control(coalescing_opts):
+            if self._closed:
+                return
+            if self._log_events:
+                log.debug("DISPATCH_{}(evh:{})", evh_type, evh.name)
+            if asyncio.iscoroutinefunction(cb):
+                await cb(evh.context, source, event_cls.deserialize(args))
+            else:
+                cb(evh.context, source, event_cls.deserialize(args))
+
+    async def dispatch_consumers(
+        self,
+        event_name: str,
+        source: AgentId,
+        args: tuple,
+    ) -> None:
+        if self._log_events:
+            log.debug("DISPATCH_CONSUMERS(ev:{}, ag:{})", event_name, source)
+        for consumer in self.consumers[event_name].copy():
+            self.consumer_taskgroup.create_task(
+                self.handle("CONSUMER", consumer, source, args),
+            )
+            await asyncio.sleep(0)
+
+    async def dispatch_subscribers(
+        self,
+        event_name: str,
+        source: AgentId,
+        args: tuple,
+    ) -> None:
+        if self._log_events:
+            log.debug("DISPATCH_SUBSCRIBERS(ev:{}, ag:{})", event_name, source)
+        for subscriber in self.subscribers[event_name].copy():
+            self.subscriber_taskgroup.create_task(
+                self.handle("SUBSCRIBER", subscriber, source, args),
+            )
+            await asyncio.sleep(0)
+
+    @preserve_termination_log
+    async def _consume_loop(self) -> None:
+        async with aclosing(
+            redis_helper.read_stream_by_group(
+                self.redis_client,
+                self._stream_key,
+                self._consumer_group,
+                self._consumer_name,
+            )
+        ) as agen:
+            async for msg_id, msg_data in agen:
+                if self._closed:
+                    return
+                if msg_data is None:
+                    continue
+                try:
+                    await self.dispatch_consumers(
+                        msg_data[b"name"].decode(),
+                        msg_data[b"source"].decode(),
+                        msgpack.unpackb(msg_data[b"args"]),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("EventDispatcher.consume(): unexpected-error")
+
+    @preserve_termination_log
+    async def _subscribe_loop(self) -> None:
+        async with aclosing(
+            redis_helper.read_stream(
+                self.redis_client,
+                self._stream_key,
+            )
+        ) as agen:
+            async for msg_id, msg_data in agen:
+                if self._closed:
+                    return
+                if msg_data is None:
+                    continue
+                try:
+                    await self.dispatch_subscribers(
+                        msg_data[b"name"].decode(),
+                        msg_data[b"source"].decode(),
+                        msgpack.unpackb(msg_data[b"args"]),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("EventDispatcher.subscribe(): unexpected-error")
+
+
+class EventProducer(aobject):
+    redis_client: RedisConnectionInfo
+    _log_events: bool
+
     def __init__(
         self,
         redis_config: EtcdRedisConfig,
         db: int = 0,
-        log_events: bool = False,
         *,
-        consumer_group: str,
         service_name: str | None = None,
         stream_key: str = "events",
-        node_id: str | None = None,
-        consumer_exception_handler: AsyncExceptionHandler | None = None,
-        subscriber_exception_handler: AsyncExceptionHandler | None = None,
+        log_events: bool = False,
     ) -> None:
         _redis_config = redis_config.copy()
         if service_name:
             _redis_config["service_name"] = service_name
+        self._closed = False
         self.redis_client = redis_helper.get_redis_object(
-            _redis_config, name="event_dispatcher.stream", db=db
+            _redis_config,
+            name="event_producer.stream",
+            db=db,
         )
         self._log_events = log_events
-        self._closed = False
-        self.consumers = defaultdict(set)
-        self.subscribers = defaultdict(set)
         self._stream_key = stream_key
-        self._consumer_group = consumer_group
-        self._consumer_name = _generate_consumer_id(node_id)
-        self.consumer_taskgroup = PersistentTaskGroup(
-            name="consumer_taskgroup",
-            exception_handler=consumer_exception_handler,
-        )
-        self.subscriber_taskgroup = PersistentTaskGroup(
-            name="subscriber_taskgroup",
-            exception_handler=subscriber_exception_handler,
-        )
 
     async def __ainit__(self) -> None:
-        self.consumer_loop_task = asyncio.create_task(self._consume_loop())
-        self.subscriber_loop_task = asyncio.create_task(self._subscribe_loop())
+        pass
 
     async def close(self) -> None:
         self._closed = True
-        try:
-            cancelled_tasks = []
-            await self.consumer_taskgroup.shutdown()
-            await self.subscriber_taskgroup.shutdown()
-            if not self.consumer_loop_task.done():
-                self.consumer_loop_task.cancel()
-                cancelled_tasks.append(self.consumer_loop_task)
-            if not self.subscriber_loop_task.done():
-                self.subscriber_loop_task.cancel()
-                cancelled_tasks.append(self.subscriber_loop_task)
-            await asyncio.gather(*cancelled_tasks, return_exceptions=True)
-        except Exception:
-            log.exception("unexpected error while closing event dispatcher")
-        finally:
-            await self.redis_client.close()
+        await self.redis_client.close()
+
+    async def produce_event(
+        self,
+        event: AbstractEvent,
+        *,
+        source: str = "manager",
+    ) -> None:
+        if self._closed:
+            return
+        raw_event = {
+            b"name": event.name.encode(),
+            b"source": source.encode(),
+            b"args": msgpack.packb(event.serialize()),
+        }
+        await redis_helper.execute(
+            self.redis_client,
+            lambda r: r.xadd(self._stream_key, raw_event),
+        )
+
+
+def _generate_consumer_id(node_id: str | None = None) -> str:
+    h = hashlib.sha1()
+    h.update(str(node_id or socket.getfqdn()).encode("utf8"))
+    hostname_hash = h.hexdigest()
+    h = hashlib.sha1()
+    h.update(__file__.encode("utf8"))
+    installation_path_hash = h.hexdigest()
+    pidx = process_index.get(0)
+    return f"{hostname_hash}:{installation_path_hash}:{pidx}"

@@ -329,33 +329,256 @@ class KernelTerminationEventArgs:
             self.exit_code,
         )
 
-    @classmethod
+        @classmethod
     def deserialize(cls, value: tuple):
         return cls(
-            KernelId(uuid.UUID(value[0])),
-            session_id=SessionId(uuid.UUID(value[1])),
-            reason=value[2],
-            exit_code=value[3],
+            SessionId(uuid.UUID(value[0])),
+            value[1],
+            value[2],
         )
 
 
-class KernelTerminatingEvent(KernelTerminationEventArgs, AbstractEvent):
-    name = "kernel_terminating"
+class SessionEnqueuedEvent(SessionCreationEventArgs, AbstractEvent):
+    name = "session_enqueued"
 
 
-class KernelTerminatedEvent(KernelTerminationEventArgs, AbstractEvent):
-    name = "kernel_terminated"
+class SessionScheduledEvent(SessionCreationEventArgs, AbstractEvent):
+    name = "session_scheduled"
+
+
+class SessionPreparingEvent(SessionCreationEventArgs, AbstractEvent):
+    name = "session_preparing"
+
+
+class SessionCancelledEvent(SessionCreationEventArgs, AbstractEvent):
+    name = "session_cancelled"
+
+
+class SessionStartedEvent(SessionCreationEventArgs, AbstractEvent):
+    name = "session_started"
 
 
 @attrs.define(slots=True, frozen=True)
-class SessionCreationEventArgs:
+class SessionTerminationEventArgs:
     session_id: SessionId = attrs.field()
-    creation_id: str = attrs.field()
-    reason: KernelLifecycleEventReason = attrs.field(default=KernelLifecycleEventReason.UNKNOWN)
+    reason: str = attrs.field(default="")
 
     def serialize(self) -> tuple:
         return (
             str(self.session_id),
-            self.creation_id,
             self.reason,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            SessionId(uuid.UUID(value[0])),
+            value[1],
+        )
+
+
+class SessionTerminatingEvent(SessionTerminationEventArgs, AbstractEvent):
+    name = "session_terminating"
+
+
+class SessionTerminatedEvent(SessionTerminationEventArgs, AbstractEvent):
+    name = "session_terminated"
+
+
+@attrs.define(slots=True, frozen=True)
+class SessionResultEventArgs:
+    session_id: SessionId = attrs.field()
+    reason: KernelLifecycleEventReason = attrs.field(default=KernelLifecycleEventReason.UNKNOWN)
+    exit_code: int = attrs.field(default=-1)
+
+    def serialize(self) -> tuple:
+        return (
+            str(self.session_id),
+            self.reason,
+            self.exit_code,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            SessionId(uuid.UUID(value[0])),
+            value[1],
+            value[2],
+        )
+
+
+class SessionSuccessEvent(SessionResultEventArgs, AbstractEvent):
+    name = "session_success"
+
+
+class SessionFailureEvent(SessionResultEventArgs, AbstractEvent):
+    name = "session_failure"
+
+
+@attrs.define(slots=True, frozen=True)
+class RouteCreationEventArgs:
+    route_id: uuid.UUID = attrs.field()
+
+    def serialize(self) -> tuple:
+        return (str(self.route_id),)
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(uuid.UUID(value[0]))
+
+
+class RouteCreatedEvent(RouteCreationEventArgs, AbstractEvent):
+    name = "route_created"
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class DoSyncKernelLogsEvent(AbstractEvent):
+    name = "do_sync_kernel_logs"
+
+    kernel_id: KernelId = attrs.field()
+    container_id: str = attrs.field()
+
+    def serialize(self) -> tuple:
+        return (
+            str(self.kernel_id),
+            self.container_id,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            KernelId(uuid.UUID(value[0])),
+            value[1],
+        )
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class GenericSessionEventArgs(AbstractEvent):
+    session_id: SessionId = attrs.field()
+
+    def serialize(self) -> tuple:
+        return (str(self.session_id),)
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            SessionId(uuid.UUID(value[0])),
+        )
+
+
+class ExecutionStartedEvent(GenericSessionEventArgs, AbstractEvent):
+    name = "execution_started"
+
+
+class ExecutionFinishedEvent(GenericSessionEventArgs, AbstractEvent):
+    name = "execution_finished"
+
+
+class ExecutionTimeoutEvent(GenericSessionEventArgs, AbstractEvent):
+    name = "execution_timeout"
+
+
+class ExecutionCancelledEvent(GenericSessionEventArgs, AbstractEvent):
+    name = "execution_cancelled"
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class BgtaskUpdatedEvent(AbstractEvent):
+    name = "bgtask_updated"
+
+    task_id: uuid.UUID = attrs.field()
+    current_progress: float = attrs.field()
+    total_progress: float = attrs.field()
+    message: Optional[str] = attrs.field(default=None)
+
+    def serialize(self) -> tuple:
+        return (
+            str(self.task_id),
+            self.current_progress,
+            self.total_progress,
+            self.message,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            uuid.UUID(value[0]),
+            value[1],
+            value[2],
+            value[3],
+        )
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class BgtaskDoneEventArgs:
+    task_id: uuid.UUID = attrs.field()
+    message: Optional[str] = attrs.field(default=None)
+
+    def serialize(self) -> tuple:
+        return (
+            str(self.task_id),
+            self.message,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            uuid.UUID(value[0]),
+            value[1],
+        )
+
+
+class BgtaskDoneEvent(BgtaskDoneEventArgs, AbstractEvent):
+    name = "bgtask_done"
+
+
+class BgtaskCancelledEvent(BgtaskDoneEventArgs, AbstractEvent):
+    name = "bgtask_cancelled"
+
+
+class BgtaskFailedEvent(BgtaskDoneEventArgs, AbstractEvent):
+    name = "bgtask_failed"
+
+
+@attrs.define(slots=True)
+class DoVolumeMountEvent(AbstractEvent):
+    name = "do_volume_mount"
+
+    dir_name: str = attrs.field()
+    volume_backend_name: str = attrs.field()
+    quota_scope_id: QuotaScopeID = attrs.field()
+
+    fs_location: str = attrs.field()
+    fs_type: str = attrs.field(default="nfs")
+    cmd_options: str | None = attrs.field(default=None)
+    scaling_group: str | None = attrs.field(default=None)
+
+    edit_fstab: bool = attrs.field(default=False)
+    fstab_path: str = attrs.field(default="/etc/fstab")
+
+    def serialize(self) -> tuple:
+        return (
+            self.dir_name,
+            self.volume_backend_name,
+            str(self.quota_scope_id),
+            self.fs_location,
+            self.fs_type,
+            self.cmd_options,
+            self.scaling_group,
+            self.edit_fstab,
+            self.fstab_path,
+        )
+
+    @classmethod
+    def deserialize(cls, value: tuple):
+        return cls(
+            dir_name=value[0],
+            volume_backend_name=value[1],
+            quota_scope_id=QuotaScopeID.parse(value[2]),
+            fs_location=value[3],
+            fs_type=value[4],
+            cmd_options=value[5],
+            scaling_group=value[6],
+            edit_fstab=value[7],
+            fstab_path=value[8],
         )

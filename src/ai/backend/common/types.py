@@ -585,34 +585,231 @@ class VFolderID:
         return self.quota_scope_id == other.quota_scope_id and self.folder_id == other.folder_id
 
 
-class VFolderUsageMode(enum.StrEnum):
+    @classmethod
+    def as_trafaret(cls) -> t.Trafaret:
+        from . import validators as tx
 
-    GENERAL = "general"
-    MODEL = "model"
-    DATA = "data"
+        return t.Dict({
+            t.Key("name"): t.String,
+            t.Key("vfid"): tx.VFolderID,
+            t.Key("vfsubpath", default="."): tx.PurePath,
+            t.Key("host_path"): tx.PurePath,
+            t.Key("kernel_path"): tx.PurePath,
+            t.Key("mount_perm"): tx.Enum(MountPermission),
+            t.Key("usage_mode", default=VFolderUsageMode.GENERAL): t.Null
+            | tx.Enum(VFolderUsageMode),
+        })
 
 
-@attrs.define(slots=True)
-class VFolderMount(JSONSerializableMixin):
-    name: str
-    vfid: VFolderID
-    vfsubpath: PurePosixPath
-    host_path: PurePosixPath
-    kernel_path: PurePosixPath
-    mount_perm: MountPermission
-    usage_mode: VFolderUsageMode
+class VFolderHostPermissionMap(dict, JSONSerializableMixin):
+    def __or__(self, other: Any) -> VFolderHostPermissionMap:
+        if self is other:
+            return self
+        if not isinstance(other, dict):
+            raise ValueError(f"Invalid type. expected `dict` type, got {type(other)} type")
+        union_map: Dict[str, set] = defaultdict(set)
+        for host, perms in [*self.items(), *other.items()]:
+            try:
+                perm_list = [VFolderHostPermission(perm) for perm in perms]
+            except ValueError:
+                raise ValueError(f"Invalid type. Permissions of Host `{host}` are ({perms})")
+            union_map[host] |= set(perm_list)
+        return VFolderHostPermissionMap(union_map)
 
     def to_json(self) -> dict[str, Any]:
-        return {
-            "name": self.name,
-            "vfid": str(self.vfid),
-            "vfsubpath": str(self.vfsubpath),
-            "host_path": str(self.host_path),
-            "kernel_path": str(self.kernel_path),
-            "mount_perm": self.mount_perm.value,
-            "usage_mode": self.usage_mode.value,
-        }
+        return {host: [perm.value for perm in perms] for host, perms in self.items()}
 
     @classmethod
-    def from_json(cls, obj: Mapping[str, Any]) -> VFolderMount:
+    def from_json(cls, obj: Mapping[str, Any]) -> JSONSerializableMixin:
         return cls(**cls.as_trafaret().check(obj))
+
+    @classmethod
+    def as_trafaret(cls) -> t.Trafaret:
+        from . import validators as tx
+
+        return t.Dict(t.String, t.List(tx.Enum(VFolderHostPermission)))
+
+
+@attrs.define(auto_attribs=True, slots=True)
+class QuotaConfig:
+    limit_bytes: int
+
+    class Validator(t.Trafaret):
+        def check_and_return(self, value: Any) -> QuotaConfig:
+            validator = t.Dict({
+                t.Key("limit_bytes"): t.ToInt(),
+            })
+            converted = validator.check(value)
+            return QuotaConfig(
+                limit_bytes=converted["limit_bytes"],
+            )
+
+    @classmethod
+    def as_trafaret(cls) -> t.Trafaret:
+        return cls.Validator()
+
+
+class QuotaScopeType(enum.StrEnum):
+    USER = "user"
+    PROJECT = "project"
+
+
+class ImageRegistry(TypedDict):
+    name: str
+    url: str
+    username: Optional[str]
+    password: Optional[str]
+
+
+class ImageConfig(TypedDict):
+    canonical: str
+    architecture: str
+    digest: str
+    repo_digest: Optional[str]
+    registry: ImageRegistry
+    labels: Mapping[str, str]
+    is_local: bool
+
+
+class ServicePort(TypedDict):
+    name: str
+    protocol: ServicePortProtocols
+    container_ports: Sequence[int]
+    host_ports: Sequence[Optional[int]]
+    is_inference: bool
+
+
+ClusterSSHPortMapping = NewType("ClusterSSHPortMapping", Mapping[str, Tuple[str, int]])
+
+
+class ClusterInfo(TypedDict):
+    mode: ClusterMode
+    size: int
+    replicas: Mapping[str, int]
+    network_name: Optional[str]
+    ssh_keypair: ClusterSSHKeyPair
+    cluster_ssh_port_mapping: Optional[ClusterSSHPortMapping]
+
+
+class ClusterSSHKeyPair(TypedDict):
+    public_key: str 
+    private_key: str
+
+class DeviceModelInfo(TypedDict):
+    device_id: DeviceId | str
+    model_name: str
+    data: Mapping[str, Any]
+
+
+class KernelCreationResult(TypedDict):
+    id: KernelId
+    container_id: ContainerId
+    service_ports: Sequence[ServicePort]
+    kernel_host: str
+    resource_spec: Mapping[str, Any]
+    attached_devices: Mapping[DeviceName, Sequence[DeviceModelInfo]]
+    repl_in_port: int
+    repl_out_port: int
+    stdin_port: int
+    stdout_port: int
+    scaling_group: str
+    agent_addr: str
+
+
+class KernelCreationConfig(TypedDict):
+    image: ImageConfig
+    auto_pull: AutoPullBehavior
+    session_type: SessionTypes
+    cluster_mode: ClusterMode
+    cluster_role: str
+    cluster_idx: int
+    cluster_hostname: str
+    resource_slots: Mapping[str, str]
+    resource_opts: Mapping[str, str]
+    environ: Mapping[str, str]
+    mounts: Sequence[Mapping[str, Any]]
+    package_directory: Sequence[str]
+    idle_timeout: int
+    bootstrap_script: Optional[str]
+    startup_command: Optional[str]
+    internal_data: Optional[Mapping[str, Any]]
+    preopen_ports: List[int]
+    allocated_host_ports: List[int]
+    scaling_group: str
+    agent_addr: str
+    endpoint_id: Optional[str]
+
+
+class SessionEnqueueingConfig(TypedDict):
+    creation_config: dict
+    kernel_configs: List[KernelEnqueueingConfig]
+
+
+class KernelEnqueueingConfig(TypedDict):
+    image_ref: ImageRef
+    cluster_role: str
+    cluster_idx: int
+    local_rank: int
+    cluster_hostname: str
+    creation_config: dict
+    bootstrap_script: str
+    startup_command: Optional[str]
+
+
+def _stringify_number(v: Union[BinarySize, int, float, Decimal]) -> str:
+    if isinstance(v, (float, Decimal)):
+        if math.isinf(v) and v > 0:
+            result = "Infinity"
+        elif math.isinf(v) and v < 0:
+            result = "-Infinity"
+        else:
+            result = "{:f}".format(v)
+    elif isinstance(v, BinarySize):
+        result = "{:d}".format(int(v))
+    elif isinstance(v, int):
+        result = "{:d}".format(v)
+    else:
+        result = str(v)
+    return result
+
+
+class Sentinel(enum.Enum):
+    TOKEN = 0
+
+
+class QueueSentinel(enum.Enum):
+    CLOSED = 0
+    TIMEOUT = 1
+
+
+class EtcdRedisConfig(TypedDict, total=False):
+    addr: Optional[HostPortPair]
+    sentinel: Optional[Union[str, List[HostPortPair]]]
+    service_name: Optional[str]
+    password: Optional[str]
+    redis_helper_config: RedisHelperConfig
+
+
+class RedisHelperConfig(TypedDict, total=False):
+    socket_timeout: float
+    socket_connect_timeout: float
+    reconnect_poll_timeout: float
+    max_connections: int
+    connection_ready_timeout: float
+
+
+@attrs.define(auto_attribs=True)
+class RedisConnectionInfo:
+    client: Redis
+    name: str
+    service_name: Optional[str]
+    sentinel: Optional[redis.asyncio.sentinel.Sentinel]
+    redis_helper_config: RedisHelperConfig
+
+    async def close(self, close_connection_pool: Optional[bool] = None) -> None:
+        await self.client.close(close_connection_pool)
+
+
+class AcceleratorNumberFormat(TypedDict):
+    binary: bool
+    round_length: int

@@ -781,35 +781,86 @@ class QueueSentinel(enum.Enum):
     CLOSED = 0
     TIMEOUT = 1
 
-
-class EtcdRedisConfig(TypedDict, total=False):
-    addr: Optional[HostPortPair]
-    sentinel: Optional[Union[str, List[HostPortPair]]]
-    service_name: Optional[str]
-    password: Optional[str]
-    redis_helper_config: RedisHelperConfig
-
-
-class RedisHelperConfig(TypedDict, total=False):
-    socket_timeout: float
-    socket_connect_timeout: float
-    reconnect_poll_timeout: float
-    max_connections: int
-    connection_ready_timeout: float
+class AcceleratorMetadata(TypedDict):
+    slot_name: str
+    description: str
+    human_readable_name: str
+    display_unit: str
+    number_format: AcceleratorNumberFormat
+    display_icon: str
 
 
-@attrs.define(auto_attribs=True)
-class RedisConnectionInfo:
-    client: Redis
+class AgentSelectionStrategy(enum.StrEnum):
+    DISPERSED = "dispersed"
+    CONCENTRATED = "concentrated"
+    LEGACY = "legacy"
+
+
+class SchedulerStatus(TypedDict):
+    trigger_event: str
+    execution_time: str
+    finish_time: NotRequired[str]
+    resource_group: NotRequired[str]
+    endpoint_name: NotRequired[str]
+    action: NotRequired[str]
+
+
+class VolumeMountableNodeType(enum.StrEnum):
+    AGENT = enum.auto()
+    STORAGE_PROXY = enum.auto()
+
+
+@dataclass
+class RoundRobinState(JSONSerializableMixin):
+    schedulable_group_id: str
+    next_index: int
+
+    def to_json(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> RoundRobinState:
+        return cls(**cls.as_trafaret().check(obj))
+
+    @classmethod
+    def as_trafaret(cls) -> t.Trafaret:
+        return t.Dict({
+            t.Key("schedulable_group_id"): t.String,
+            t.Key("next_index"): t.Int,
+        })
+
+
+RoundRobinStates: TypeAlias = dict[str, dict[str, RoundRobinState]]
+
+SSLContextType: TypeAlias = bool | Fingerprint | SSLContext
+
+
+class ModelServiceStatus(enum.Enum):
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+
+
+class RuntimeVariant(enum.StrEnum):
+    VLLM = "vllm"
+    NIM = "nim"
+    CMD = "cmd"
+    CUSTOM = "custom"
+
+
+@dataclass
+class ModelServiceProfile:
     name: str
-    service_name: Optional[str]
-    sentinel: Optional[redis.asyncio.sentinel.Sentinel]
-    redis_helper_config: RedisHelperConfig
-
-    async def close(self, close_connection_pool: Optional[bool] = None) -> None:
-        await self.client.close(close_connection_pool)
+    health_check_endpoint: str | None = dataclasses.field(default=None)
+    port: int | None = dataclasses.field(default=None)
 
 
-class AcceleratorNumberFormat(TypedDict):
-    binary: bool
-    round_length: int
+MODEL_SERVICE_RUNTIME_PROFILES: Mapping[RuntimeVariant, ModelServiceProfile] = {
+    RuntimeVariant.CUSTOM: ModelServiceProfile(name="Custom (Default)"),
+    RuntimeVariant.VLLM: ModelServiceProfile(
+        name="vLLM", health_check_endpoint="/health", port=8000
+    ),
+    RuntimeVariant.NIM: ModelServiceProfile(
+        name="NVIDIA NIM", health_check_endpoint="/v1/health/ready", port=8000
+    ),
+    RuntimeVariant.CMD: ModelServiceProfile(name="Predefined Image Command"),
+}

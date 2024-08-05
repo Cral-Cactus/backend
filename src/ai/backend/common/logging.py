@@ -348,36 +348,221 @@ def log_worker(
     agg_sock = zctx.socket(zmq.PULL)
     agg_sock.bind(log_endpoint)
     ep_url = yarl.URL(log_endpoint)
-    if ep_url.scheme.lower() == "ipc":
-        os.chmod(ep_url.path, 0o777)
-    try:
-        ready_event.set()
-        while True:
-            data = agg_sock.recv()
-            if not data:
-                return
-            unpacked_data = msgpack.unpackb(data)
-            if not unpacked_data:
-                break
-            rec = logging.makeLogRecord(unpacked_data)
-            if rec is None:
-                break
-            if console_handler:
-                console_handler.emit(rec)
-            try:
-                if file_handler:
-                    file_handler.emit(rec)
-                if logstash_handler:
-                    logstash_handler.emit(rec)
-                    print("logstash")
-                if graylog_handler:
-                    graylog_handler.emit(rec)
-            except OSError:
-                continue
-    finally:
-        if logstash_handler:
-            logstash_handler.cleanup()
-        if graylog_handler:
-            graylog_handler.close()
-        agg_sock.close()
-        zctx.term()
+
+class RelayHandler(logging.Handler):
+    _sock: zmq.Socket | None
+
+    def __init__(self, *, endpoint: str) -> None:
+        super().__init__()
+        self.endpoint = endpoint
+        self._zctx = zmq.Context()
+        if endpoint:
+            self._sock = self._zctx.socket(zmq.PUSH)
+            assert self._sock is not None
+            self._sock.setsockopt(zmq.LINGER, 100)
+            self._sock.connect(self.endpoint)
+        else:
+            self._sock = None
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+        self._zctx.term()
+
+    def _fallback(self, record: Optional[logging.LogRecord]) -> None:
+        if record is None:
+            return
+        print(record.getMessage(), file=sys.stderr)
+
+    def emit(self, record: Optional[logging.LogRecord]) -> None:
+        if self._sock is None:
+            self._fallback(record)
+            return
+        if record:
+            log_body = {
+                "name": record.name,
+                "pathname": record.pathname,
+                "lineno": record.lineno,
+                "msg": record.getMessage(),
+                "levelno": record.levelno,
+                "levelname": record.levelname,
+            }
+            if record.exc_info:
+                log_body["exc_info"] = traceback.format_exception(*record.exc_info)
+        else:
+            log_body = None
+        try:
+            serialized_record = msgpack.packb(log_body)
+            self._sock.send(serialized_record)
+        except zmq.ZMQError:
+            self._fallback(record)
+
+
+class AbstractLogger(metaclass=ABCMeta):
+    def __init__(
+        self,
+        logging_config: MutableMapping[str, Any],
+    ) -> None:
+        pass
+
+    @abstractmethod
+    def __enter__(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def __exit__(self, *exc_info_args):
+        raise NotImplementedError
+
+
+class NoopLogger(AbstractLogger):
+    def __init__(
+        self,
+        logging_config: MutableMapping[str, Any],
+    ) -> None:
+        pass
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, *exc_info_args):
+        pass
+
+
+class LocalLogger(AbstractLogger):
+    def __init__(
+        self,
+        logging_config: MutableMapping[str, Any],
+    ) -> None:
+        cfg = logging_config_iv.check(logging_config)
+        _check_driver_config_exists_if_activated(cfg, "console")
+        self.logging_config = cfg
+        log_handlers = []
+        if "console" in self.logging_config["drivers"]:
+            console_handler = setup_console_log_handler(self.logging_config)
+            log_handlers.append(console_handler)
+        if "file" in self.logging_config["drivers"]:
+            file_handler = setup_file_log_handler(self.logging_config)
+            log_handlers.append(file_handler)
+        self.log_config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "handlers": {
+                "null": {"class": "logging.NullHandler"},
+            },
+            "loggers": {
+                "": {
+                    "handlers": [],
+                    "level": cfg["level"],
+                },
+                **{
+                    k: {
+                        "handlers": [],
+                        "level": v,
+                        "propagate": False,
+                    }
+                    for k, v in cfg["pkg-ns"].items()
+                },
+            },
+        }
+        logging.config.dictConfig(self.log_config)
+        root_logger = logging.getLogger(None)
+        for h in log_handlers:
+            root_logger.addHandler(h)
+        for pkg_ns in cfg["pkg-ns"].keys():
+            ns_logger = logging.getLogger(pkg_ns)
+            for h in log_handlers:
+                ns_logger.addHandler(h)
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, *exc_info_args):
+        pass
+
+
+class Logger(AbstractLogger):
+    is_master: bool
+    log_endpoint: str
+    logging_config: Mapping[str, Any]
+    log_config: MutableMapping[str, Any]
+    log_worker: threading.Thread
+
+    def __init__(
+        self,
+        logging_config: MutableMapping[str, Any],
+        *,
+        is_master: bool,
+        log_endpoint: str,
+    ) -> None:
+        legacy_logfile_path = os.environ.get("BACKEND_LOG_FILE")
+        if legacy_logfile_path:
+            p = Path(legacy_logfile_path)
+            config.override_key(logging_config, ("file", "path"), p.parent)
+            config.override_key(logging_config, ("file", "filename"), p.name)
+        config.override_with_env(logging_config, ("file", "backup-count"), "BACKEND_LOG_FILE_COUNT")
+        legacy_logfile_size = os.environ.get("BACKEND_LOG_FILE_SIZE")
+        if legacy_logfile_size:
+            legacy_logfile_size = f"{legacy_logfile_size}M"
+            config.override_with_env(logging_config, ("file", "rotation-size"), legacy_logfile_size)
+
+        cfg = logging_config_iv.check(logging_config)
+
+        _check_driver_config_exists_if_activated(cfg, "console")
+        _check_driver_config_exists_if_activated(cfg, "file")
+        _check_driver_config_exists_if_activated(cfg, "logstash")
+        _check_driver_config_exists_if_activated(cfg, "graylog")
+
+        self.is_master = is_master
+        self.log_endpoint = log_endpoint
+        self.logging_config = cfg
+        self.log_config = {
+            "version": 1,
+            "disable_existing_loggers": False,
+            "handlers": {
+                "null": {"class": "logging.NullHandler"},
+            },
+            "loggers": {
+                "": {"handlers": [], "level": cfg["level"]},
+                **{
+                    k: {"handlers": [], "level": v, "propagate": False}
+                    for k, v in cfg["pkg-ns"].items()
+                },
+            },
+        }
+
+    def __enter__(self):
+        self.log_config["handlers"]["relay"] = {
+            "class": "ai.backend.common.logging.RelayHandler",
+            "level": self.logging_config["level"],
+            "endpoint": self.log_endpoint,
+        }
+        for _logger in self.log_config["loggers"].values():
+            _logger["handlers"].append("relay")
+        logging.config.dictConfig(self.log_config)
+        self._is_active_token = is_active.set(True)
+        if self.is_master and self.log_endpoint:
+            self.relay_handler = logging.getLogger("").handlers[0]
+            self.ready_event = threading.Event()
+            assert isinstance(self.relay_handler, RelayHandler)
+            self.log_worker = threading.Thread(
+                target=log_worker,
+                name="Logger",
+                args=(self.logging_config, os.getpid(), self.log_endpoint, self.ready_event),
+            )
+            self.log_worker.start()
+            self.ready_event.wait()
+
+    def __exit__(self, *exc_info_args):
+        is_active.reset(self._is_active_token)
+        if self.is_master and self.log_endpoint:
+            self.relay_handler.emit(None)
+            self.log_worker.join()
+            self.relay_handler.close()
+            ep_url = yarl.URL(self.log_endpoint)
+            if ep_url.scheme.lower() == "ipc" and (ep_sock := Path(ep_url.path)).exists():
+                ep_sock.unlink()
+
+
+def _check_driver_config_exists_if_activated(cfg, driver):
+    if driver in cfg["drivers"] and cfg[driver] is None:
+        raise ConfigurationError({"logging": f"{driver} driver is activated but no config given."})

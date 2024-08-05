@@ -385,25 +385,234 @@ class ResourceSlot(UserDict):
         other_values = [other.data[k] for k in common_keys]
         return self_values == other_values and all(self[k] == 0 for k in only_self_keys)
 
-    def __le__(self, other: ResourceSlot) -> bool:
-        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
-        self.sync_keys(other)
-        self_values = [self.data[k] for k in self.keys()]
-        other_values = [other.data[k] for k in self.keys()]
-        return not any(s > o for s, o in zip(self_values, other_values))
-
-    def __lt__(self, other: ResourceSlot) -> bool:
-        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
-        self.sync_keys(other)
-        self_values = [self.data[k] for k in self.keys()]
-        other_values = [other.data[k] for k in self.keys()]
-        return not any(s > o for s, o in zip(self_values, other_values)) and not (
-            self_values == other_values
-        )
-
-    def __ge__(self, other: ResourceSlot) -> bool:
+            def __gt__(self, other: ResourceSlot) -> bool:
         assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
         self.sync_keys(other)
         self_values = [self.data[k] for k in other.keys()]
         other_values = [other.data[k] for k in other.keys()]
-        return not any(s < o for s, o in zip(self_values, other_values))
+        return not any(s < o for s, o in zip(self_values, other_values)) and not (
+            self_values == other_values
+        )
+
+    def normalize_slots(self, *, ignore_unknown: bool) -> ResourceSlot:
+        known_slots = current_resource_slots.get()
+        unset_slots = known_slots.keys() - self.data.keys()
+        if not ignore_unknown and (unknown_slots := self.data.keys() - known_slots.keys()):
+            raise ValueError(f"Unknown slots: {', '.join(map(repr, unknown_slots))}")
+        data = {k: v for k, v in self.data.items() if k in known_slots}
+        for k in unset_slots:
+            data[k] = Decimal(0)
+        return type(self)(data)
+
+    @classmethod
+    def _normalize_value(cls, key: str, value: Any, unit: SlotTypes) -> Decimal:
+        try:
+            if unit == SlotTypes.BYTES:
+                if isinstance(value, Decimal):
+                    return Decimal(value) if value.is_finite() else value
+                if isinstance(value, int):
+                    return Decimal(value)
+                value = Decimal(BinarySize.from_str(value))
+            else:
+                value = Decimal(value)
+                if value.is_finite():
+                    value = value.quantize(Quantum).normalize()
+        except (
+            ArithmeticError,
+            ValueError,
+        ):
+            raise ValueError(f"Cannot convert the slot {key!r} to decimal: {value!r}")
+        return value
+
+    @classmethod
+    def _humanize_value(cls, value: Decimal, unit: str) -> str:
+        if unit == "bytes":
+            try:
+                result = "{:s}".format(BinarySize(value))
+            except (OverflowError, ValueError):
+                result = _stringify_number(value)
+        else:
+            result = _stringify_number(value)
+        return result
+
+    @classmethod
+    def _guess_slot_type(cls, key: str) -> SlotTypes:
+        if "mem" in key:
+            return SlotTypes.BYTES
+        return SlotTypes.COUNT
+
+    @classmethod
+    def from_policy(cls, policy: Mapping[str, Any], slot_types: Mapping) -> "ResourceSlot":
+        try:
+            data = {
+                k: cls._normalize_value(k, v, slot_types[k])
+                for k, v in policy["total_resource_slots"].items()
+                if v is not None and k in slot_types
+            }
+            fill = Decimal(0)
+            if policy["default_for_unspecified"] == DefaultForUnspecified.UNLIMITED:
+                fill = Decimal("Infinity")
+            for k in slot_types.keys():
+                if k not in data:
+                    data[k] = fill
+        except KeyError as e:
+            raise ValueError(f"Unknown slot type: {e.args[0]!r}")
+        return cls(data)
+
+    @classmethod
+    def from_user_input(
+        cls,
+        obj: Mapping[str, Any],
+        slot_types: Optional[Mapping[SlotName, SlotTypes]],
+    ) -> "ResourceSlot":
+        try:
+            if slot_types is None:
+                data = {
+                    k: cls._normalize_value(k, v, cls._guess_slot_type(k))
+                    for k, v in obj.items()
+                    if v is not None
+                }
+            else:
+                data = {
+                    k: cls._normalize_value(k, v, slot_types[SlotName(k)])
+                    for k, v in obj.items()
+                    if v is not None
+                }
+                # fill missing
+                for k in slot_types.keys():
+                    if k not in data:
+                        data[k] = Decimal(0)
+        except KeyError as e:
+            extra_guide = ""
+            if e.args[0] == "shmem":
+                extra_guide = " (Put it at the 'resource_opts' field in API, or use '--resource-opts shmem=...' in CLI)"
+            raise ValueError(f"Unknown slot type: {e.args[0]!r}" + extra_guide)
+        return cls(data)
+
+    def to_humanized(self, slot_types: Mapping) -> Mapping[str, str]:
+        try:
+            return {
+                k: type(self)._humanize_value(v, slot_types[k])
+                for k, v in self.data.items()
+                if v is not None
+            }
+        except KeyError as e:
+            raise ValueError(f"Unknown slot type: {e.args[0]!r}")
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> "ResourceSlot":
+        data = {k: Decimal(v) for k, v in obj.items() if v is not None}
+        return cls(data)
+
+    def to_json(self) -> Mapping[str, str]:
+        return {k: _stringify_number(Decimal(v)) for k, v in self.data.items() if v is not None}
+
+
+class JSONSerializableMixin(metaclass=ABCMeta):
+    @abstractmethod
+    def to_json(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> JSONSerializableMixin:
+        return cls(**cls.as_trafaret().check(obj))
+
+    @classmethod
+    @abstractmethod
+    def as_trafaret(cls) -> t.Trafaret:
+        raise NotImplementedError
+
+
+@attrs.define(slots=True, frozen=True)
+class QuotaScopeID:
+    scope_type: QuotaScopeType
+    scope_id: uuid.UUID
+
+    @classmethod
+    def parse(cls, raw: str) -> QuotaScopeID:
+        scope_type, _, rest = raw.partition(":")
+        match scope_type.lower():
+            case QuotaScopeType.PROJECT | QuotaScopeType.USER as t:
+                return cls(t, uuid.UUID(rest))
+            case _:
+                raise ValueError(f"Invalid quota scope type: {scope_type!r}")
+
+    def __str__(self) -> str:
+        match self.scope_id:
+            case uuid.UUID():
+                return f"{self.scope_type}:{str(self.scope_id)}"
+            case _:
+                raise ValueError(f"Invalid quota scope ID: {self.scope_id!r}")
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+    @property
+    def pathname(self) -> str:
+        match self.scope_id:
+            case uuid.UUID():
+                return self.scope_id.hex
+            case _:
+                raise ValueError(f"Invalid quota scope ID: {self.scope_id!r}")
+
+
+class VFolderID:
+    quota_scope_id: QuotaScopeID | None
+    folder_id: uuid.UUID
+
+    @classmethod
+    def from_row(cls, row: Any) -> VFolderID:
+        return VFolderID(quota_scope_id=row["quota_scope_id"], folder_id=row["id"])
+
+    def __init__(self, quota_scope_id: QuotaScopeID | str | None, folder_id: uuid.UUID) -> None:
+        self.folder_id = folder_id
+        match quota_scope_id:
+            case QuotaScopeID():
+                self.quota_scope_id = quota_scope_id
+            case str():
+                self.quota_scope_id = QuotaScopeID.parse(quota_scope_id)
+            case None:
+                self.quota_scope_id = None
+            case _:
+                self.quota_scope_id = QuotaScopeID.parse(str(quota_scope_id))
+
+    def __str__(self) -> str:
+        if self.quota_scope_id is None:
+            return self.folder_id.hex
+        return f"{self.quota_scope_id}/{self.folder_id.hex}"
+
+    def __eq__(self, other) -> bool:
+        return self.quota_scope_id == other.quota_scope_id and self.folder_id == other.folder_id
+
+
+class VFolderUsageMode(enum.StrEnum):
+
+    GENERAL = "general"
+    MODEL = "model"
+    DATA = "data"
+
+
+@attrs.define(slots=True)
+class VFolderMount(JSONSerializableMixin):
+    name: str
+    vfid: VFolderID
+    vfsubpath: PurePosixPath
+    host_path: PurePosixPath
+    kernel_path: PurePosixPath
+    mount_perm: MountPermission
+    usage_mode: VFolderUsageMode
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "vfid": str(self.vfid),
+            "vfsubpath": str(self.vfsubpath),
+            "host_path": str(self.host_path),
+            "kernel_path": str(self.kernel_path),
+            "mount_perm": self.mount_perm.value,
+            "usage_mode": self.usage_mode.value,
+        }
+
+    @classmethod
+    def from_json(cls, obj: Mapping[str, Any]) -> VFolderMount:
+        return cls(**cls.as_trafaret().check(obj))

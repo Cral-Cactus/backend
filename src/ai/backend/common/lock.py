@@ -251,27 +251,24 @@ class RedisLock(AbstractDistributedLock):
         return val
 
 
-class EtcetraLock(AbstractDistributedLock):
-    _con_mgr: Optional[EtcetraConnectionManager]
-    _debug: bool
+    async def __aenter__(self) -> EtcetraCommunicator:
+        self._con_mgr = self.etcd.etcd.with_lock(
+            self.lock_name,
+            timeout=self._timeout,
+            ttl=int(self._lifetime) if self._lifetime is not None else None,
+        )
+        assert (
+            self._con_mgr is not None
+        )
+        communicator = await self._con_mgr.__aenter__()
+        if self._debug:
+            log.debug("etcd lock acquired")
+        return communicator
 
-    lock_name: str
-    etcd: EtcetraAsyncEtcd
-    timeout: float
-
-    default_timeout: float = 9600
-
-    def __init__(
-        self,
-        lock_name: str,
-        etcd: EtcetraAsyncEtcd,
-        *,
-        timeout: Optional[float] = None,
-        lifetime: Optional[float] = None,
-        debug: bool = False,
-    ) -> None:
-        super().__init__(lifetime=lifetime)
-        self.lock_name = lock_name
-        self.etcd = etcd
-        self._timeout = timeout if timeout is not None else self.default_timeout
-        self._debug = debug
+    async def __aexit__(self, *exc_info) -> Optional[bool]:
+        assert self._con_mgr is not None
+        await self._con_mgr.__aexit__(*exc_info)
+        if self._debug:
+            log.debug("etcd lock released")
+        self._con_mgr = None
+        return None

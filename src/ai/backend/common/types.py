@@ -193,36 +193,217 @@ class ReadableCIDR(Generic[_Address]):
         self._is_network = is_network
         self._address = self._convert_to_cidr(address) if address is not None else None
 
-    def _convert_to_cidr(self, value: str) -> _Address:
-        str_val = str(value)
-        if not self._is_network:
-            return cast(_Address, ip_address(str_val))
-        if "*" in str_val:
-            _ip, _, given_cidr = str_val.partition("/")
-            filtered = _ip.replace("*", "0")
-            if given_cidr:
-                return self._to_ip_network(f"{filtered}/{given_cidr}")
-            octets = _ip.split(".")
-            cidr = octets.index("*") * 8
-            return self._to_ip_network(f"{filtered}/{cidr}")
-        return self._to_ip_network(str_val)
+class BinarySize(int):
+
+    suffix_map = {
+        "y": 2**80,
+        "Y": 2**80,  # yotta
+        "z": 2**70,
+        "Z": 2**70,  # zetta
+        "e": 2**60,
+        "E": 2**60,  # exa
+        "p": 2**50,
+        "P": 2**50,  # peta
+        "t": 2**40,
+        "T": 2**40,  # tera
+        "g": 2**30,
+        "G": 2**30,  # giga
+        "m": 2**20,
+        "M": 2**20,  # mega
+        "k": 2**10,
+        "K": 2**10,  # kilo
+        " ": 1,
+    }
+    suffices = (" ", "K", "M", "G", "T", "P", "E", "Z", "Y")
+    endings = ("ibytes", "ibyte", "ib", "bytes", "byte", "b")
+
+    @classmethod
+    def _parse_str(cls, expr: str) -> Union[BinarySize, Decimal]:
+        if expr.lower() in ("inf", "infinite", "infinity"):
+            return Decimal("Infinity")
+        orig_expr = expr
+        expr = expr.strip().replace("_", "")
+        try:
+            return cls(expr)
+        except ValueError:
+            expr = expr.lower()
+            dec_expr: Decimal
+            try:
+                for ending in cls.endings:
+                    if expr.endswith(ending):
+                        length = len(ending) + 1
+                        suffix = expr[-length]
+                        dec_expr = Decimal(expr[:-length])
+                        break
+                else:
+                    if not str.isnumeric(expr[-1]):
+                        suffix = expr[-1]
+                        dec_expr = Decimal(expr[:-1])
+                    else:
+                        raise ValueError("Fractional bytes are not allowed")
+            except ArithmeticError:
+                raise ValueError("Unconvertible value", orig_expr)
+            try:
+                multiplier = cls.suffix_map[suffix]
+            except KeyError:
+                raise ValueError("Unconvertible value", orig_expr)
+            return cls(dec_expr * multiplier)
+
+    @classmethod
+    def finite_from_str(
+        cls,
+        expr: Union[str, Decimal, numbers.Integral],
+    ) -> BinarySize:
+        if isinstance(expr, Decimal):
+            if expr.is_infinite():
+                raise ValueError("infinite values are not allowed")
+            return cls(expr)
+        if isinstance(expr, numbers.Integral):
+            return cls(int(expr))
+        result = cls._parse_str(expr)
+        if isinstance(result, Decimal) and result.is_infinite():
+            raise ValueError("infinite values are not allowed")
+        return cls(int(result))
+
+    @classmethod
+    def from_str(
+        cls,
+        expr: Union[str, Decimal, numbers.Integral],
+    ) -> Union[BinarySize, Decimal]:
+        if isinstance(expr, Decimal):
+            return cls(expr)
+        if isinstance(expr, numbers.Integral):
+            return cls(int(expr))
+        return cls._parse_str(expr)
+
+    def _preformat(self):
+        scale = self
+        suffix_idx = 0
+        while scale >= 1024:
+            scale //= 1024
+            suffix_idx += 1
+        return suffix_idx
 
     @staticmethod
-    def _to_ip_network(val: str) -> _Address:
-        try:
-            return cast(_Address, ip_network(val))
-        except ValueError:
-            raise InvalidIpAddressValue
+    def _quantize(val, multiplier):
+        d = Decimal(val) / Decimal(multiplier)
+        if d == d.to_integral():
+            value = d.quantize(Decimal(1))
+        else:
+            value = d.quantize(Decimal(".00")).normalize()
+        return value
 
-    @property
-    def address(self) -> _Address | None:
-        return self._address
+    def __str__(self):
+        suffix_idx = self._preformat()
+        if suffix_idx == 0:
+            if self == 1:
+                return f"{int(self)} byte"
+            else:
+                return f"{int(self)} bytes"
+        else:
+            suffix = type(self).suffices[suffix_idx]
+            multiplier = type(self).suffix_map[suffix]
+            value = self._quantize(self, multiplier)
+            return f"{value} {suffix.upper()}iB"
 
-    def __str__(self) -> str:
-        return str(self._address)
+    def __format__(self, format_spec):
+        if len(format_spec) != 1:
+            raise ValueError("format-string for BinarySize can be only one character.")
+        if format_spec == "s":
+            suffix_idx = self._preformat()
+            if suffix_idx == 0:
+                return f"{int(self)}"
+            suffix = type(self).suffices[suffix_idx]
+            multiplier = type(self).suffix_map[suffix]
+            value = self._quantize(self, multiplier)
+            return f"{value}{suffix.lower()}"
+        else:
+            suffix = format_spec.lower()
+            multiplier = type(self).suffix_map.get(suffix)
+            if multiplier is None:
+                raise ValueError("Unsupported scale unit.", suffix)
+            value = self._quantize(self, multiplier)
+            return f"{value}{suffix.lower()}".strip()
+
+
+class ResourceSlot(UserDict):
+    __slots__ = ("data",)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+
+    def sync_keys(self, other: ResourceSlot) -> None:
+        self_only_keys = self.data.keys() - other.data.keys()
+        other_only_keys = other.data.keys() - self.data.keys()
+        for k in self_only_keys:
+            other.data[k] = Decimal(0)
+        for k in other_only_keys:
+            self.data[k] = Decimal(0)
+
+    def __add__(self, other: ResourceSlot) -> ResourceSlot:
+        assert isinstance(other, ResourceSlot), "Only can add ResourceSlot to ResourceSlot."
+        self.sync_keys(other)
+        return type(self)({
+            k: self.get(k, 0) + other.get(k, 0) for k in (self.keys() | other.keys())
+        })
+
+    def __sub__(self, other: ResourceSlot) -> ResourceSlot:
+        assert isinstance(other, ResourceSlot), "Only can subtract ResourceSlot from ResourceSlot."
+        self.sync_keys(other)
+        return type(self)({k: self.data[k] - other.get(k, 0) for k in self.keys()})
+
+    def __neg__(self):
+        return type(self)({k: -v for k, v in self.data.items()})
 
     def __eq__(self, other: object) -> bool:
         if other is self:
             return True
-        assert isinstance(other, ReadableCIDR), "Only can compare ReadableCIDR objects."
-        return self.address == other.address
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        self.sync_keys(other)
+        self_values = [self.data[k] for k in sorted(self.data.keys())]
+        other_values = [other.data[k] for k in sorted(other.data.keys())]
+        return self_values == other_values
+
+    def __ne__(self, other: object) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        self.sync_keys(other)
+        return not self.__eq__(other)
+
+    def eq_contains(self, other: ResourceSlot) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        common_keys = sorted(other.keys() & self.keys())
+        only_other_keys = other.keys() - self.keys()
+        self_values = [self.data[k] for k in common_keys]
+        other_values = [other.data[k] for k in common_keys]
+        return self_values == other_values and all(other[k] == 0 for k in only_other_keys)
+
+    def eq_contained(self, other: ResourceSlot) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        common_keys = sorted(other.keys() & self.keys())
+        only_self_keys = self.keys() - other.keys()
+        self_values = [self.data[k] for k in common_keys]
+        other_values = [other.data[k] for k in common_keys]
+        return self_values == other_values and all(self[k] == 0 for k in only_self_keys)
+
+    def __le__(self, other: ResourceSlot) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        self.sync_keys(other)
+        self_values = [self.data[k] for k in self.keys()]
+        other_values = [other.data[k] for k in self.keys()]
+        return not any(s > o for s, o in zip(self_values, other_values))
+
+    def __lt__(self, other: ResourceSlot) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        self.sync_keys(other)
+        self_values = [self.data[k] for k in self.keys()]
+        other_values = [other.data[k] for k in self.keys()]
+        return not any(s > o for s, o in zip(self_values, other_values)) and not (
+            self_values == other_values
+        )
+
+    def __ge__(self, other: ResourceSlot) -> bool:
+        assert isinstance(other, ResourceSlot), "Only can compare ResourceSlot objects."
+        self.sync_keys(other)
+        self_values = [self.data[k] for k in other.keys()]
+        other_values = [other.data[k] for k in other.keys()]
+        return not any(s < o for s, o in zip(self_values, other_values))

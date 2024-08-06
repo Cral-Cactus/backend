@@ -265,43 +265,223 @@ class IPAddress(t.Trafaret):
             self._failure("Invalid IP address format", value=value)
 
 
-class HostPortPair(t.Trafaret):
-    def __init__(self, *, allow_blank_host: bool = False) -> None:
-        super().__init__()
-        self._allow_blank_host = allow_blank_host
-
-    def check_and_return(self, value: Any) -> Tuple[ipaddress._BaseAddress, int]:
-        host: str | ipaddress._BaseAddress
+class PortRange(t.Trafaret):
+    def check_and_return(self, value: Any) -> Tuple[int, int]:
         if isinstance(value, str):
-            pair = value.rsplit(":", maxsplit=1)
-            if len(pair) == 1:
-                self._failure("value as string must contain both address and number", value=value)
-            host, port = pair[0], pair[1]
+            try:
+                value = tuple(map(int, value.split("-")))
+            except (TypeError, ValueError):
+                self._failure(
+                    "value as string should be a hyphen-separated pair of integers", value=value
+                )
         elif isinstance(value, Sequence):
             if len(value) != 2:
-                self._failure(
-                    "value as array must contain only two values for address and number",
-                    value=value,
-                )
-            host, port = value[0], value[1]
-        elif isinstance(value, Mapping):
-            try:
-                host, port = value["host"], value["port"]
-            except KeyError:
-                self._failure('value as map must contain "host" and "port" keys', value=value)
+                self._failure("value as array must contain only two values", value=value)
         else:
             self._failure("urecognized value type", value=value)
         try:
-            if isinstance(host, str):
-                host = ipaddress.ip_address(host.strip("[]"))
-            elif isinstance(host, ipaddress._BaseAddress):
-                pass
-        except ValueError:
-            pass
-        if not self._allow_blank_host and not host:
-            self._failure("value has empty host", value=value)
-        try:
-            port = t.ToInt[1:65535].check(port)
+            min_port = t.Int[1:65535].check(value[0])
+            max_port = t.Int[1:65535].check(value[1])
         except t.DataError:
-            self._failure("port number must be between 1 and 65535", value=value)
-        return _HostPortPair(host, port)
+            self._failure("each value must be a valid port number", value=value)
+        if not (min_port < max_port):
+            self._failure("first value must be less than second value", value=value)
+        return min_port, max_port
+
+
+class UserID(t.Trafaret):
+    def __init__(self, *, default_uid: int = None) -> None:
+        super().__init__()
+        self._default_uid = default_uid
+
+    def check_and_return(self, value: Any) -> int:
+        if value is None:
+            if self._default_uid is not None:
+                return self._default_uid
+            else:
+                return os.getuid()
+        elif isinstance(value, int):
+            if value == -1:
+                return os.getuid()
+        elif isinstance(value, str):
+            if not value:
+                if self._default_uid is not None:
+                    return self._default_uid
+                else:
+                    return os.getuid()
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    return pwd.getpwnam(value).pw_uid
+                except KeyError:
+                    self._failure("no such user in system", value=value)
+            else:
+                return self.check_and_return(value)
+        else:
+            self._failure("value must be either int or str", value=value)
+        return value
+
+
+class GroupID(t.Trafaret):
+    def __init__(self, *, default_gid: int = None) -> None:
+        super().__init__()
+        self._default_gid = default_gid
+
+    def check_and_return(self, value: Any) -> int:
+        if value is None:
+            if self._default_gid is not None:
+                return self._default_gid
+            else:
+                return os.getgid()
+        elif isinstance(value, int):
+            if value == -1:
+                return os.getgid()
+        elif isinstance(value, str):
+            if not value:
+                if self._default_gid is not None:
+                    return self._default_gid
+                else:
+                    return os.getgid()
+            try:
+                value = int(value)
+            except ValueError:
+                try:
+                    return pwd.getpwnam(value).pw_gid
+                except KeyError:
+                    self._failure("no such group in system", value=value)
+            else:
+                return self.check_and_return(value)
+        else:
+            self._failure("value must be either int or str", value=value)
+        return value
+
+
+class UUID(t.Trafaret):
+    def check_and_return(self, value: Any) -> uuid.UUID:
+        try:
+            if isinstance(value, uuid.UUID):
+                return value
+            if isinstance(value, str):
+                return uuid.UUID(value)
+            elif isinstance(value, bytes):
+                return uuid.UUID(bytes=value)
+            else:
+                self._failure("value must be string or bytes", value=value)
+        except ValueError:
+            self._failure("cannot convert value to UUID", value=value)
+
+
+class QuotaScopeID(t.Trafaret):
+    regex = r"^[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*:[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)*$"
+
+    def check_and_return(self, value: Any) -> _QuotaScopeID:
+        return _QuotaScopeID.parse(t.Regexp(self.regex).check(value))
+
+
+class VFolderID(t.Trafaret):
+    def check_and_return(self, value: Any) -> _VFolderID:
+        tuple_t = t.Tuple(QuotaScopeID(), UUID())
+        match value:
+            case str():
+                pieces = value.partition("/")
+                if len(pieces[2]) == 0:
+                    converted = (None, UUID().check(pieces[0]))
+                else:
+                    converted = tuple_t.check((pieces[0], pieces[2]))
+            case tuple():
+                converted = tuple_t.check(value)
+            case _:
+                self._failure("cannot convert value to VFolderID", value=value)
+        return _VFolderID(
+            quota_scope_id=converted[0],
+            folder_id=converted[1],
+        )
+
+
+class TimeZone(t.Trafaret):
+    def check_and_return(self, value: Any) -> datetime.tzinfo:
+        if not isinstance(value, str):
+            self._failure("value must be string", value=value)
+        tz = dateutil.tz.gettz(value)
+        if tz is None:
+            self._failure("value is not a known timezone", value=value)
+        return tz
+
+
+class TimeDuration(t.Trafaret):
+
+    def __init__(self, *, allow_negative: bool = False) -> None:
+        self._allow_negative = allow_negative
+
+    def check_and_return(self, value: Any) -> Union[datetime.timedelta, relativedelta]:
+        if not isinstance(value, (int, float, str)):
+            self._failure("value must be a number or string", value=value)
+        if isinstance(value, (int, float)):
+            return datetime.timedelta(seconds=value)
+        assert isinstance(value, str)
+        if len(value) == 0:
+            self._failure("value must not be empty", value=value)
+        try:
+            unit = value[-1]
+            if unit.isdigit():
+                t = float(value)
+                if not self._allow_negative and t < 0:
+                    self._failure("value must be positive", value=value)
+                return datetime.timedelta(seconds=t)
+            elif value[-2:].isalpha():
+                t = int(value[:-2])
+                if not self._allow_negative and t < 0:
+                    self._failure("value must be positive", value=value)
+                if value[-2:] == "yr":
+                    return relativedelta(years=t)
+                elif value[-2:] == "mo":
+                    return relativedelta(months=t)
+                else:
+                    self._failure("value is not a known time duration", value=value)
+            else:
+                t = float(value[:-1])
+                if not self._allow_negative and t < 0:
+                    self._failure("value must be positive", value=value)
+                if value[-1] == "w":
+                    return datetime.timedelta(weeks=t)
+                elif value[-1] == "d":
+                    return datetime.timedelta(days=t)
+                elif value[-1] == "h":
+                    return datetime.timedelta(hours=t)
+                elif value[-1] == "m":
+                    return datetime.timedelta(minutes=t)
+                elif value[-1] == "s":
+                    return datetime.timedelta(seconds=t)
+                else:
+                    self._failure("value is not a known time duration", value=value)
+        except ValueError:
+            self._failure(f"invalid numeric literal: {value[:-1]}", value=value)
+
+class Slug(t.Trafaret, metaclass=StringLengthMeta):
+    _negative_head_patterns = {
+        (True, True): re.compile(r"^[\s._-]+"),
+        (True, False): re.compile(r"^[\s_-]+"),
+        (False, True): re.compile(r"^[._-]+"),
+        (False, False): re.compile(r"^[_-]+"),
+    }
+
+     _negative_tail_patterns = {
+        (True, True): re.compile(r"[\s._-]+$"),
+        (True, False): re.compile(r"[\s_-]+$"),
+        (False, True): re.compile(r"[._-]+$"),
+        (False, False): re.compile(r"[_-]+$"),
+    }
+
+    _negative_consecutive_patterns = {
+        (True, True): re.compile(r"[\s._-]{2,}"),
+        (True, False): re.compile(r"[\s_-]{2,}"),
+        (False, True): re.compile(r"[._-]{2,}"),
+        (False, False): re.compile(r"[_-]{2,}"),
+    }
+    _positive_body_pattern_sources = {
+        (True, True): r"[\w\s.-]+",
+        (True, False): r"[\w\s-]+",
+        (False, True): r"[\w.-]+",
+        (False, False): r"[\w-]+",
+    }

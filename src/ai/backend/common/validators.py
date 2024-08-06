@@ -459,29 +459,139 @@ class TimeDuration(t.Trafaret):
             self._failure(f"invalid numeric literal: {value[:-1]}", value=value)
 
 class Slug(t.Trafaret, metaclass=StringLengthMeta):
-    _negative_head_patterns = {
-        (True, True): re.compile(r"^[\s._-]+"),
-        (True, False): re.compile(r"^[\s_-]+"),
-        (False, True): re.compile(r"^[._-]+"),
-        (False, False): re.compile(r"^[_-]+"),
-    }
+        def __init__(
+        self,
+        *,
+        min_length: Optional[int] = None,
+        max_length: Optional[int] = None,
+        allow_dot: bool = False,
+        allow_space: bool = False,
+        allow_unicode: bool = False,
+    ) -> None:
+        super().__init__()
+        self._negative_head_pattern = self._negative_head_patterns[(allow_space, allow_dot)]
+        self._negative_tail_pattern = self._negative_tail_patterns[(allow_space, allow_dot)]
+        self._negative_consecutive_pattern = self._negative_consecutive_patterns[
+            (allow_space, allow_dot)
+        ]
+        self._positive_body_pattern = re.compile(
+            self._positive_body_pattern_sources[(allow_space, allow_dot)],
+            re.UNICODE if allow_unicode else re.ASCII,
+        )
+        if min_length is not None and min_length < 0:
+            raise TypeError("min_length must be larger than or equal to zero.")
+        if max_length is not None and max_length < 0:
+            raise TypeError("max_length must be larger than or equal to zero.")
+        if max_length is not None and min_length is not None and min_length > max_length:
+            raise TypeError("min_length must be less than or equal to max_length when both set.")
+        self._min_length = min_length
+        self._max_length = max_length
 
-     _negative_tail_patterns = {
-        (True, True): re.compile(r"[\s._-]+$"),
-        (True, False): re.compile(r"[\s_-]+$"),
-        (False, True): re.compile(r"[._-]+$"),
-        (False, False): re.compile(r"[_-]+$"),
-    }
+    def check_and_return(self, value: Any) -> str:
+        if isinstance(value, str):
+            if self._min_length is not None and len(value) < self._min_length:
+                self._failure(f"value is too short (min length {self._min_length})", value=value)
+            if self._max_length is not None and len(value) > self._max_length:
+                self._failure(f"value is too long (max length {self._max_length})", value=value)
+            if self._negative_head_pattern.search(value):
+                self._failure("value should not begin with non-word characters.")
+            if self._negative_tail_pattern.search(value):
+                self._failure("value should not end with non-word characters.")
+            if self._negative_consecutive_pattern.search(value):
+                self._failure("value should contain consecutive non-word characters.")
+            if not self._positive_body_pattern.fullmatch(value):
+                self._failure("value must be a valid slug.", value=value)
+        else:
+            self._failure("value must be a string", value=value)
+        return value
 
-    _negative_consecutive_patterns = {
-        (True, True): re.compile(r"[\s._-]{2,}"),
-        (True, False): re.compile(r"[\s_-]{2,}"),
-        (False, True): re.compile(r"[._-]{2,}"),
-        (False, False): re.compile(r"[_-]{2,}"),
-    }
-    _positive_body_pattern_sources = {
-        (True, True): r"[\w\s.-]+",
-        (True, False): r"[\w\s-]+",
-        (False, True): r"[\w.-]+",
-        (False, False): r"[\w-]+",
-    }
+
+if jwt_available:
+
+    class JsonWebToken(t.Trafaret):
+        default_algorithms = ["HS256"]
+
+        def __init__(
+            self,
+            *,
+            secret: str,
+            inner_iv: t.Trafaret = None,
+            algorithms: list[str] = default_algorithms,
+        ) -> None:
+            self.secret = secret
+            self.algorithms = algorithms
+            self.inner_iv = inner_iv
+
+        def check_and_return(self, value: Any) -> Mapping[str, Any]:
+            try:
+                token_data = jwt.decode(value, self.secret, algorithms=self.algorithms)
+                if self.inner_iv is not None:
+                    return self.inner_iv.check(token_data)
+                return token_data
+            except jwt.PyJWTError as e:
+                self._failure(f"cannot decode the given value as JWT: {e}", value=value)
+
+
+class URL(t.Trafaret):
+    def __init__(
+        self,
+        *,
+        scheme_required: bool = True,
+    ) -> None:
+        self.scheme_required = scheme_required
+
+    def check_and_return(self, value: Any) -> yarl.URL:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        try:
+            parsed_url = yarl.URL(value)
+            if self.scheme_required:
+                parsed_url.origin()
+        except (ValueError, TypeError) as e:
+            self._failure(repr(e), value=value)
+        else:
+            return parsed_url
+
+
+class ToSet(t.Trafaret):
+    def check_and_return(self, value: Any) -> set:
+        if isinstance(value, Iterable):
+            return set(value)
+        else:
+            self._failure("value must be Iterable")
+
+
+class Delay(t.Trafaret):
+
+    def check_and_return(self, value: Any) -> float:
+        match value:
+            case float() | int():
+                return float(value)
+            case (a, b):
+                return random.uniform(a, b)
+            case None:
+                return 0
+            case _:
+                self._failure(f"Value must be (float, tuple of float or None), not {type(value)}.")
+
+
+class RoundRobinStatesJSONString(t.Trafaret):
+    def check_and_return(self, value: Any) -> RoundRobinStates:
+        try:
+            rr_states_dict: dict[str, dict[str, dict[str, Any]]] = json.loads(value)
+        except (KeyError, ValueError, json.decoder.JSONDecodeError):
+            self._failure(
+                f"Expected valid JSON string, got `{value}`. RoundRobinStatesJSONString should"
+                " be a valid JSON string",
+                value=value,
+            )
+
+        rr_states: RoundRobinStates = {}
+        for resource_group, arch_rr_states_dict in rr_states_dict.items():
+            rr_states[resource_group] = {}
+            for arch, rr_state_dict in arch_rr_states_dict.items():
+                if "next_index" not in rr_state_dict or "schedulable_group_id" not in rr_state_dict:
+                    self._failure("Invalid roundrobin states")
+                rr_states[resource_group][arch] = RoundRobinState.from_json(rr_state_dict)
+
+        return rr_states

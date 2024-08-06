@@ -680,23 +680,147 @@ def build_root_app(
     return app
 
 
+    try:
+        m.start()
+        aiomon_started = True
+    except Exception as e:
+        log.warning("aiomonitor could not start but skipping this error to continue", exc_info=e)
+
+    # Plugin webapps should be loaded before runner.setup(),
+    # which freezes on_startup event.
+    try:
+        async with (
+            shared_config_ctx(root_ctx),
+            webapp_plugin_ctx(root_app),
+        ):
+            ssl_ctx = None
+            if root_ctx.local_config["manager"]["ssl-enabled"]:
+                ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+                ssl_ctx.load_cert_chain(
+                    str(root_ctx.local_config["manager"]["ssl-cert"]),
+                    str(root_ctx.local_config["manager"]["ssl-privkey"]),
+                )
+
+            runner = web.AppRunner(root_app, keepalive_timeout=30.0)
+            await runner.setup()
+            service_addr = root_ctx.local_config["manager"]["service-addr"]
+            site = web.TCPSite(
+                runner,
+                str(service_addr.host),
+                service_addr.port,
+                backlog=1024,
+                reuse_port=True,
+                ssl_context=ssl_ctx,
+            )
+            await site.start()
+
+            if os.geteuid() == 0:
+                uid = root_ctx.local_config["manager"]["user"]
+                gid = root_ctx.local_config["manager"]["group"]
+                os.setgroups([
+                    g.gr_gid for g in grp.getgrall() if pwd.getpwuid(uid).pw_name in g.gr_mem
+                ])
+                os.setgid(gid)
+                os.setuid(uid)
+                log.info("changed process uid and gid to {}:{}", uid, gid)
+            log.info("started handling API requests at {}", service_addr)
+
+            try:
+                yield
+            finally:
+                log.info("shutting down...")
+                await runner.cleanup()
+    finally:
+        if aiomon_started:
+            m.close()
+
+
 @actxmgr
-async def server_main(
+async def server_main_logwrapper(
     loop: asyncio.AbstractEventLoop,
     pidx: int,
     _args: List[Any],
 ) -> AsyncIterator[None]:
-    root_app = build_root_app(pidx, _args[0], subapp_pkgs=global_subapp_pkgs)
-    root_ctx: RootContext = root_app["_root.context"]
-    loop.set_debug(root_ctx.local_config["debug"]["asyncio"])
-    m = aiomonitor.Monitor(
-        loop,
-        termui_port=root_ctx.local_config["manager"]["aiomonitor-termui-port"] + pidx,
-        webui_port=root_ctx.local_config["manager"]["aiomonitor-webui-port"] + pidx,
-        console_enabled=False,
-        hook_task_factory=root_ctx.local_config["debug"]["enhanced-aiomonitor-task-info"],
-    )
-    m.prompt = f"monitor (manager[{pidx}@{os.getpid()}]) >>> "
-    m.console_locals["root_app"] = root_app
-    m.console_locals["root_ctx"] = root_ctx
-    aiomon_started = False
+    setproctitle(f"backend.ai: manager worker-{pidx}")
+    log_endpoint = _args[1]
+    logger = Logger(_args[0]["logging"], is_master=False, log_endpoint=log_endpoint)
+    try:
+        with logger:
+            async with server_main(loop, pidx, _args):
+                yield
+    except Exception:
+        traceback.print_exc()
+
+
+@click.group(invoke_without_command=True)
+@click.option(
+    "-f",
+    "--config-path",
+    "--config",
+    type=Path,
+    default=None,
+    help="The config file path. (default: ./manager.toml and /etc/backend.ai/manager.toml)",
+)
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="This option will soon change to --log-level TEXT option.",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice([*LogSeverity], case_sensitive=False),
+    default=LogSeverity.INFO,
+    help="Set the logging verbosity level",
+)
+@click.pass_context
+def main(
+    ctx: click.Context,
+    config_path: Path,
+    log_level: LogSeverity,
+    debug: bool = False,
+) -> None:
+
+    cfg = load_config(config_path, LogSeverity.DEBUG if debug else log_level)
+
+    if ctx.invoked_subcommand is None:
+        cfg["manager"]["pid-file"].write_text(str(os.getpid()))
+        ipc_base_path = cfg["manager"]["ipc-base-path"]
+        log_sockpath = ipc_base_path / f"manager-logger-{os.getpid()}.sock"
+        log_endpoint = f"ipc://{log_sockpath}"
+        try:
+            logger = Logger(cfg["logging"], is_master=True, log_endpoint=log_endpoint)
+            with logger:
+                ns = cfg["etcd"]["namespace"]
+                setproctitle(f"backend.ai: manager {ns}")
+                log.info("Backend.AI Manager {0}", __version__)
+                log.info("runtime: {0}", env_info())
+                log_config = logging.getLogger("ai.backend.manager.config")
+                log_config.debug("debug mode enabled.")
+                if cfg["manager"]["event-loop"] == "uvloop":
+                    import uvloop
+
+                    uvloop.install()
+                    log.info("Using uvloop as the event loop backend")
+                try:
+                    aiotools.start_server(
+                        server_main_logwrapper,
+                        num_workers=cfg["manager"]["num-proc"],
+                        args=(cfg, log_endpoint),
+                        wait_timeout=5.0,
+                    )
+                finally:
+                    log.info("terminated.")
+        finally:
+            if cfg["manager"]["pid-file"].is_file():
+                cfg["manager"]["pid-file"].unlink()
+    else:
+        pass
+
+
+@main.group(cls=LazyGroup, import_name="ai.backend.manager.api.auth:cli")
+def auth() -> None:
+    pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -244,39 +244,228 @@ class IdleCheckerHost:
                 check_results = await asyncio.gather(*check_task, return_exceptions=True)
                 terminated = False
                 errors = []
-                for checker, result in zip(self._checkers, check_results):
-                    if isinstance(result, aiotools.TaskGroupError):
-                        errors.extend(result.__errors__)
-                        continue
-                    elif isinstance(result, Exception):
-                        errors.append(result)
-                        continue
-                    if not result:
-                        log.info(
-                            "The {} idle checker triggered termination of s:{}",
-                            checker.name,
-                            kernel["session_id"],
-                        )
-                        if not terminated:
-                            terminated = True
-                            await self._event_producer.produce_event(
-                                DoTerminateSessionEvent(
-                                    kernel["session_id"],
-                                    checker.terminate_reason,
-                                ),
-                            )
-                if errors:
-                    raise IdleCheckerError("idle checker(s) raise errors", errors)
 
-    async def get_idle_check_report(
+class AbstractIdleCheckReporter(metaclass=ABCMeta):
+    remaining_time_type: RemainingTimeType
+    name: ClassVar[str] = "base"
+    report_key: ClassVar[str] = "base"
+    extra_info_key: ClassVar[str] = "base_extra"
+
+    def __init__(
+        self,
+        event_dispatcher: EventDispatcher,
+        redis_live: RedisConnectionInfo,
+        redis_stat: RedisConnectionInfo,
+    ) -> None:
+        self._event_dispatcher = event_dispatcher
+        self._redis_live = redis_live
+        self._redis_stat = redis_stat
+
+    async def aclose(self) -> None:
+        pass
+
+    @abstractmethod
+    async def populate_config(self, config: Mapping[str, Any]) -> None:
+        raise NotImplementedError
+
+    async def update_app_streaming_status(
         self,
         session_id: SessionId,
-    ) -> dict[str, Any]:
-        return {
-            checker.name: {
-                "remaining": await checker.get_checker_result(self._redis_live, session_id),
-                "remaining_time_type": checker.remaining_time_type.value,
-                "extra": await checker.get_extra_info(session_id),
-            }
-            for checker in self._checkers
-        }
+        status: AppStreamingStatus,
+    ) -> None:
+        pass
+
+    @classmethod
+    def get_report_key(cls, session_id: SessionId) -> str:
+        return f"session.{session_id}.{cls.name}.report"
+
+    @abstractmethod
+    async def get_extra_info(self, session_id: SessionId) -> Optional[dict[str, Any]]:
+        return None
+
+    @abstractmethod
+    async def get_checker_result(
+        self,
+        redis_obj: RedisConnectionInfo,
+        session_id: SessionId,
+    ) -> Optional[float]:
+        pass
+
+    async def set_remaining_time_report(
+        self, redis_obj: RedisConnectionInfo, session_id: SessionId, remaining: float
+    ) -> None:
+        await redis_helper.execute(
+            redis_obj,
+            lambda r: r.set(
+                self.get_report_key(session_id),
+                msgpack.packb(remaining),
+                ex=int(DEFAULT_CHECK_INTERVAL) * 10,
+            ),
+        )
+
+
+class AbstractIdleChecker(metaclass=ABCMeta):
+    terminate_reason: KernelLifecycleEventReason
+
+    @abstractmethod
+    async def check_idleness(
+        self,
+        kernel: Row,
+        dbconn: SAConnection,
+        policy: Row,
+        redis_obj: RedisConnectionInfo,
+        *,
+        grace_period_end: Optional[datetime] = None,
+    ) -> bool:
+
+        return True
+
+
+class NewUserGracePeriodChecker(AbstractIdleCheckReporter):
+    remaining_time_type: RemainingTimeType = RemainingTimeType.GRACE_PERIOD
+    name: ClassVar[str] = "user_grace_period"
+    report_key: ClassVar[str] = "user_grace_period"
+    user_initial_grace_period: Optional[timedelta] = None
+
+    _config_iv = t.Dict(
+        {
+            t.Key("user_initial_grace_period", default=None): t.Null | tx.TimeDuration(),
+        },
+    ).allow_extra("*")
+
+    async def populate_config(self, raw_config: Mapping[str, Any]) -> None:
+        config = self._config_iv.check(raw_config)
+        self.user_initial_grace_period = config["user_initial_grace_period"]
+        _grace_period = (
+            self.user_initial_grace_period.total_seconds()
+            if self.user_initial_grace_period is not None
+            else None
+        )
+
+        log.info(
+            f"NewUserGracePeriodChecker: default period = {_grace_period} seconds",
+        )
+
+    async def get_extra_info(self, session_id: SessionId) -> Optional[dict[str, Any]]:
+        return None
+
+    async def del_remaining_time_report(
+        self, redis_obj: RedisConnectionInfo, session_id: SessionId
+    ) -> None:
+        await redis_helper.execute(
+            redis_obj,
+            lambda r: r.delete(
+                self.get_report_key(session_id),
+            ),
+        )
+
+    async def get_grace_period_end(
+        self,
+        kernel: Row,
+    ) -> Optional[datetime]:
+
+        if self.user_initial_grace_period is None:
+            return None
+        user_created_at: datetime = kernel["user_created_at"]
+        return user_created_at + self.user_initial_grace_period
+
+    @property
+    def grace_period_const(self) -> float:
+        return (
+            self.user_initial_grace_period.total_seconds()
+            if self.user_initial_grace_period is not None
+            else 0
+        )
+
+    async def get_checker_result(
+        self,
+        redis_obj: RedisConnectionInfo,
+        session_id: SessionId,
+    ) -> Optional[float]:
+        key = self.get_report_key(session_id)
+        data = await redis_helper.execute(redis_obj, lambda r: r.get(key))
+        return msgpack.unpackb(data) if data is not None else None
+
+
+class BaseIdleChecker(AbstractIdleChecker, AbstractIdleCheckReporter):
+    pass
+
+
+class NetworkTimeoutIdleChecker(BaseIdleChecker):
+
+    terminate_reason: KernelLifecycleEventReason = KernelLifecycleEventReason.IDLE_TIMEOUT
+    remaining_time_type: RemainingTimeType = RemainingTimeType.EXPIRE_AFTER
+    name: ClassVar[str] = "network_timeout"
+    report_key: ClassVar[str] = "network_timeout"
+    extra_info_key: ClassVar[str] = "network_timeout_timeout_extra"
+
+    _config_iv = t.Dict(
+        {
+            t.Key("threshold", default="10m"): tx.TimeDuration(),
+        },
+    ).allow_extra("*")
+
+    idle_timeout: timedelta
+    _evhandlers: List[EventHandler[None, AbstractEvent]]
+
+    def __init__(
+        self,
+        event_dispatcher: EventDispatcher,
+        redis_live: RedisConnectionInfo,
+        redis_stat: RedisConnectionInfo,
+    ) -> None:
+        super().__init__(event_dispatcher, redis_live, redis_stat)
+        d = self._event_dispatcher
+        (d.subscribe(SessionStartedEvent, None, self._session_started_cb),)
+        self._evhandlers = [
+            d.consume(ExecutionStartedEvent, None, self._execution_started_cb),
+            d.consume(ExecutionFinishedEvent, None, self._execution_exited_cb),
+            d.consume(ExecutionTimeoutEvent, None, self._execution_exited_cb),
+            d.consume(ExecutionCancelledEvent, None, self._execution_exited_cb),
+        ]
+
+    async def aclose(self) -> None:
+        for _evh in self._evhandlers:
+            self._event_dispatcher.unconsume(_evh)
+
+    async def populate_config(self, raw_config: Mapping[str, Any]) -> None:
+        config = self._config_iv.check(raw_config)
+        self.idle_timeout = config["threshold"]
+        log.info(
+            "NetworkTimeoutIdleChecker: default idle_timeout = {0:,} seconds",
+            self.idle_timeout.total_seconds(),
+        )
+
+    async def update_app_streaming_status(
+        self,
+        session_id: SessionId,
+        status: AppStreamingStatus,
+    ) -> None:
+        if status == AppStreamingStatus.HAS_ACTIVE_CONNECTIONS:
+            await self._disable_timeout(session_id)
+        elif status == AppStreamingStatus.NO_ACTIVE_CONNECTIONS:
+            await self._update_timeout(session_id)
+
+    async def _disable_timeout(self, session_id: SessionId) -> None:
+        log.debug(f"NetworkTimeoutIdleChecker._disable_timeout({session_id})")
+        await redis_helper.execute(
+            self._redis_live,
+            lambda r: r.set(
+                f"session.{session_id}.last_access",
+                "0",
+                xx=True,
+            ),
+        )
+
+    async def _update_timeout(self, session_id: SessionId) -> None:
+        log.debug(f"NetworkTimeoutIdleChecker._update_timeout({session_id})")
+        t = await redis_helper.execute(self._redis_live, lambda r: r.time())
+        t = t[0] + (t[1] / (10**6))
+        await redis_helper.execute(
+            self._redis_live,
+            lambda r: r.set(
+                f"session.{session_id}.last_access",
+                f"{t:.06f}",
+                ex=max(86400, int(self.idle_timeout.total_seconds() * 2)),
+            ),
+        )

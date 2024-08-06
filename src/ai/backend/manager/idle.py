@@ -830,35 +830,49 @@ class UtilizationIdleChecker(BaseIdleChecker):
             )
         return check_result
 
-    async def get_current_utilization(
+    async def get_checker_result(
         self,
-        kernel_ids: Sequence[KernelId],
-        occupied_slots: Mapping[str, Any],
-    ) -> Mapping[str, float] | None:
-        try:
-            utilizations = {k: 0.0 for k in self.resource_thresholds.keys()}
-            live_stat = {}
-            divider = len(kernel_ids) if kernel_ids else 1
-            for kernel_id in kernel_ids:
-                raw_live_stat = cast(
-                    bytes | None,
-                    await redis_helper.execute(
-                        self._redis_stat,
-                        lambda r: r.get(str(kernel_id)),
-                    ),
-                )
-                if raw_live_stat is None:
-                    log.warning(
-                        f"Utilization data not found or failed to fetch utilization data, abort idle check (k:{kernel_id})"
-                    )
-                    return None
-                live_stat = cast(dict[str, Any], msgpack.unpackb(raw_live_stat))
-                kernel_utils = {
-                    k: float(nmget(live_stat, f"{k}.pct", 0.0))
-                    for k in self.resource_thresholds.keys()
-                }
+        redis_obj: RedisConnectionInfo,
+        session_id: SessionId,
+    ) -> Optional[float]:
+        key = self.get_report_key(session_id)
+        data = await redis_helper.execute(redis_obj, lambda r: r.get(key))
+        return msgpack.unpackb(data) if data is not None else None
 
-                utilizations = {
-                    k: utilizations[k] + kernel_utils[k] for k in self.resource_thresholds.keys()
-                }
-            utilizations = {k: utilizations[k] / divider for k in self.resource_thresholds.keys()}
+
+checker_registry: Mapping[str, Type[BaseIdleChecker]] = {
+    NetworkTimeoutIdleChecker.name: NetworkTimeoutIdleChecker,
+    UtilizationIdleChecker.name: UtilizationIdleChecker,
+}
+
+
+async def init_idle_checkers(
+    db: SAEngine,
+    shared_config: SharedConfig,
+    event_dispatcher: EventDispatcher,
+    event_producer: EventProducer,
+    lock_factory: DistributedLockFactory,
+) -> IdleCheckerHost:
+
+    checker_host = IdleCheckerHost(
+        db,
+        shared_config,
+        event_dispatcher,
+        event_producer,
+        lock_factory,
+    )
+    checker_init_args = (event_dispatcher, checker_host._redis_live, checker_host._redis_stat)
+    log.info("Initializing idle checker: user_initial_grace_period, session_lifetime")
+    checker_host.add_checker(SessionLifetimeChecker(*checker_init_args))
+    enabled_checkers = await shared_config.etcd.get("config/idle/enabled")
+    if enabled_checkers:
+        for checker_name in enabled_checkers.split(","):
+            checker_name = checker_name.strip()
+            checker_cls = checker_registry.get(checker_name, None)
+            if checker_cls is None:
+                log.warning("ignoring an unknown idle checker name: {}", checker_name)
+                continue
+            log.info("Initializing idle checker: {}", checker_name)
+            checker_instance = checker_cls(*checker_init_args)
+            checker_host.add_checker(checker_instance)
+    return checker_host

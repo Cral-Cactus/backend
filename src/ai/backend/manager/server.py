@@ -292,11 +292,221 @@ async def idle_checker_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
 
 
 @actxmgr
-async def storage_manager_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
-    from .models.storage import StorageSessionManager
-
-    raw_vol_config = await root_ctx.shared_config.etcd.get_prefix("volumes")
-    config = volume_config_iv.check(raw_vol_config)
-    root_ctx.storage_manager = StorageSessionManager(config)
+async def hook_plugin_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    ctx = HookPluginContext(root_ctx.shared_config.etcd, root_ctx.local_config)
+    root_ctx.hook_plugin_ctx = ctx
+    await ctx.init(
+        context=root_ctx,
+        allowlist=root_ctx.local_config["manager"]["allowed-plugins"],
+        blocklist=root_ctx.local_config["manager"]["disabled-plugins"],
+    )
+    hook_result = await ctx.dispatch(
+        "ACTIVATE_MANAGER",
+        (),
+        return_when=ALL_COMPLETED,
+    )
+    if hook_result.status != PASSED:
+        raise RuntimeError("Could not activate the manager instance.")
     yield
-    await root_ctx.storage_manager.aclose()
+    await ctx.cleanup()
+
+
+@actxmgr
+async def agent_registry_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    from zmq.auth.certs import load_certificate
+
+    from .registry import AgentRegistry
+
+    manager_pkey, manager_skey = load_certificate(
+        root_ctx.local_config["manager"]["rpc-auth-manager-keypair"]
+    )
+    assert manager_skey is not None
+    manager_public_key = PublicKey(manager_pkey)
+    manager_secret_key = SecretKey(manager_skey)
+    root_ctx.agent_cache = AgentRPCCache(root_ctx.db, manager_public_key, manager_secret_key)
+    root_ctx.registry = AgentRegistry(
+        root_ctx.local_config,
+        root_ctx.shared_config,
+        root_ctx.db,
+        root_ctx.agent_cache,
+        root_ctx.redis_stat,
+        root_ctx.redis_live,
+        root_ctx.redis_image,
+        root_ctx.redis_stream,
+        root_ctx.event_dispatcher,
+        root_ctx.event_producer,
+        root_ctx.storage_manager,
+        root_ctx.hook_plugin_ctx,
+        debug=root_ctx.local_config["debug"]["enabled"],
+        manager_public_key=manager_public_key,
+        manager_secret_key=manager_secret_key,
+    )
+    await root_ctx.registry.init()
+    yield
+    await root_ctx.registry.shutdown()
+
+
+@actxmgr
+async def sched_dispatcher_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    from .scheduler.dispatcher import SchedulerDispatcher
+
+    sched_dispatcher = await SchedulerDispatcher.new(
+        root_ctx.local_config,
+        root_ctx.shared_config,
+        root_ctx.event_dispatcher,
+        root_ctx.event_producer,
+        root_ctx.distributed_lock_factory,
+        root_ctx.registry,
+    )
+    yield
+    await sched_dispatcher.close()
+
+
+@actxmgr
+async def monitoring_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    from .plugin.monitor import ManagerErrorPluginContext, ManagerStatsPluginContext
+
+    ectx = ManagerErrorPluginContext(root_ctx.shared_config.etcd, root_ctx.local_config)
+    sctx = ManagerStatsPluginContext(root_ctx.shared_config.etcd, root_ctx.local_config)
+    init_success = False
+    try:
+        await ectx.init(
+            context={"_root.context": root_ctx},
+            allowlist=root_ctx.local_config["manager"]["allowed-plugins"],
+        )
+        await sctx.init(allowlist=root_ctx.local_config["manager"]["allowed-plugins"])
+    except Exception:
+        log.error("Failed to initialize monitoring plugins")
+    else:
+        init_success = True
+        root_ctx.error_monitor = ectx
+        root_ctx.stats_monitor = sctx
+    yield
+    if init_success:
+        await sctx.cleanup()
+        await ectx.cleanup()
+
+
+@actxmgr
+async def hanging_session_scanner_ctx(root_ctx: RootContext) -> AsyncIterator[None]:
+    from contextlib import suppress
+    from datetime import timedelta
+    from typing import TYPE_CHECKING
+
+    import sqlalchemy as sa
+    from dateutil.relativedelta import relativedelta
+    from dateutil.tz import tzutc
+    from sqlalchemy.orm import load_only, noload
+
+    from .config import session_hang_tolerance_iv
+    from .models.session import SessionStatus
+
+    if TYPE_CHECKING:
+        from .models.utils import ExtendedAsyncSAEngine
+
+    async def _fetch_hanging_sessions(
+        db: ExtendedAsyncSAEngine,
+        status: SessionStatus,
+        threshold: relativedelta | timedelta,
+    ) -> tuple[SessionRow, ...]:
+        query = (
+            sa.select(SessionRow)
+            .where(SessionRow.status == status)
+            .where(
+                (
+                    datetime.now(tz=tzutc())
+                    - SessionRow.status_history[status.name].astext.cast(
+                        sa.types.DateTime(timezone=True)
+                    )
+                )
+                > threshold
+            )
+            .options(
+                noload("*"),
+                load_only(SessionRow.id, SessionRow.name, SessionRow.status, SessionRow.access_key),
+            )
+        )
+        async with db.begin_readonly() as conn:
+            result = await conn.execute(query)
+            return result.fetchall()
+
+    async def _force_terminate_hanging_sessions(
+        status: SessionStatus,
+        threshold: relativedelta | timedelta,
+        interval: float,
+    ) -> None:
+        try:
+            sessions = await _fetch_hanging_sessions(root_ctx.db, status, threshold)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("fetching hanging sessions error: {}", repr(e), exc_info=e)
+            return
+
+        log.debug(f"{len(sessions)} {status.name} sessions found.")
+
+        results_and_exceptions = await asyncio.gather(
+            *[
+                asyncio.create_task(
+                    root_ctx.registry.destroy_session(
+                        session, forced=True, reason=KernelLifecycleEventReason.HANG_TIMEOUT
+                    ),
+                )
+                for session in sessions
+            ],
+            return_exceptions=True,
+        )
+        for result_or_exception in results_and_exceptions:
+            if isinstance(result_or_exception, (BaseException, Exception)):
+                log.error(
+                    "hanging session force-termination error: {}",
+                    repr(result_or_exception),
+                    exc_info=result_or_exception,
+                )
+
+    session_hang_tolerance = session_hang_tolerance_iv.check(
+        await root_ctx.shared_config.etcd.get_prefix_dict("config/session/hang-tolerance")
+    )
+
+    session_force_termination_tasks = []
+    heuristic_interval_weight = 0.4
+    max_interval = timedelta(hours=1).total_seconds()
+    threshold: relativedelta | timedelta
+    for status, threshold in session_hang_tolerance["threshold"].items():
+        try:
+            session_status = SessionStatus[status]
+        except KeyError:
+            continue
+        if isinstance(threshold, relativedelta):
+            interval = max_interval
+        else:  # timedelta
+            interval = min(max_interval, threshold.total_seconds() * heuristic_interval_weight)
+        session_force_termination_tasks.append(
+            aiotools.create_timer(
+                functools.partial(_force_terminate_hanging_sessions, session_status, threshold),
+                interval,
+            )
+        )
+
+    yield
+
+    for task in session_force_termination_tasks:
+        if not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+class background_task_ctx:
+    def __init__(self, root_ctx: RootContext) -> None:
+        self.root_ctx = root_ctx
+
+    async def __aenter__(self) -> None:
+        self.root_ctx.background_task_manager = BackgroundTaskManager(self.root_ctx.event_producer)
+
+    async def __aexit__(self, *exc_info) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        if hasattr(self.root_ctx, "background_task_manager"):
+            await self.root_ctx.background_task_manager.shutdown()

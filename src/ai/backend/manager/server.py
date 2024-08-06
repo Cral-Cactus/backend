@@ -479,7 +479,7 @@ async def hanging_session_scanner_ctx(root_ctx: RootContext) -> AsyncIterator[No
             continue
         if isinstance(threshold, relativedelta):
             interval = max_interval
-        else:  # timedelta
+        else:
             interval = min(max_interval, threshold.total_seconds() * heuristic_interval_weight)
         session_force_termination_tasks.append(
             aiotools.create_timer(
@@ -490,23 +490,213 @@ async def hanging_session_scanner_ctx(root_ctx: RootContext) -> AsyncIterator[No
 
     yield
 
-    for task in session_force_termination_tasks:
-        if not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+def handle_loop_error(
+    root_ctx: RootContext,
+    loop: asyncio.AbstractEventLoop,
+    context: Mapping[str, Any],
+) -> None:
+    exception = context.get("exception")
+    msg = context.get("message", "(empty message)")
+    if exception is not None:
+        if sys.exc_info()[0] is not None:
+            log.exception("Error inside event loop: {0}", msg)
+            if (error_monitor := getattr(root_ctx, "error_monitor", None)) is not None:
+                loop.create_task(error_monitor.capture_exception())
+        else:
+            exc_info = (type(exception), exception, exception.__traceback__)
+            log.error("Error inside event loop: {0}", msg, exc_info=exc_info)
+            if (error_monitor := getattr(root_ctx, "error_monitor", None)) is not None:
+                loop.create_task(error_monitor.capture_exception(exc_instance=exception))
 
 
-class background_task_ctx:
-    def __init__(self, root_ctx: RootContext) -> None:
-        self.root_ctx = root_ctx
+def _init_subapp(
+    pkg_name: str,
+    root_app: web.Application,
+    subapp: web.Application,
+    global_middlewares: Iterable[WebMiddleware],
+) -> None:
+    subapp.on_response_prepare.append(on_prepare)
 
-    async def __aenter__(self) -> None:
-        self.root_ctx.background_task_manager = BackgroundTaskManager(self.root_ctx.event_producer)
+    async def _set_root_ctx(subapp: web.Application):
+        subapp["_root.context"] = root_app["_root.context"]
+        subapp["_root_app"] = root_app
 
-    async def __aexit__(self, *exc_info) -> None:
-        pass
+    subapp.on_startup.insert(0, _set_root_ctx)
+    if "prefix" not in subapp:
+        subapp["prefix"] = pkg_name.split(".")[-1].replace("_", "-")
+    prefix = subapp["prefix"]
+    root_app.add_subapp("/" + prefix, subapp)
+    root_app.middlewares.extend(global_middlewares)
 
-    async def shutdown(self) -> None:
-        if hasattr(self.root_ctx, "background_task_manager"):
-            await self.root_ctx.background_task_manager.shutdown()
+
+def init_subapp(pkg_name: str, root_app: web.Application, create_subapp: AppCreator) -> None:
+    root_ctx: RootContext = root_app["_root.context"]
+    subapp, global_middlewares = create_subapp(root_ctx.cors_options)
+    _init_subapp(pkg_name, root_app, subapp, global_middlewares)
+
+
+def init_lock_factory(root_ctx: RootContext) -> DistributedLockFactory:
+    ipc_base_path = root_ctx.local_config["manager"]["ipc-base-path"]
+    manager_id = root_ctx.local_config["manager"]["id"]
+    lock_backend = root_ctx.local_config["manager"]["distributed-lock"]
+    log.debug("using {} as the distributed lock backend", lock_backend)
+    match lock_backend:
+        case "filelock":
+            from ai.backend.common.lock import FileLock
+
+            return lambda lock_id, lifetime_hint: FileLock(
+                ipc_base_path / f"{manager_id}.{lock_id}.lock",
+                timeout=0,
+            )
+        case "pg_advisory":
+            from .pglock import PgAdvisoryLock
+
+            return lambda lock_id, lifetime_hint: PgAdvisoryLock(root_ctx.db, lock_id)
+        case "redlock":
+            from ai.backend.common.lock import RedisLock
+
+            redlock_config = root_ctx.local_config["manager"]["redlock-config"]
+
+            return lambda lock_id, lifetime_hint: RedisLock(
+                str(lock_id),
+                root_ctx.redis_lock,
+                lifetime=min(lifetime_hint * 2, lifetime_hint + 30),
+                lock_retry_interval=redlock_config["lock_retry_interval"],
+            )
+        case "etcd":
+            from ai.backend.common.lock import EtcdLock
+
+            return lambda lock_id, lifetime_hint: EtcdLock(
+                str(lock_id),
+                root_ctx.shared_config.etcd,
+                lifetime=min(lifetime_hint * 2, lifetime_hint + 30),
+            )
+        case "etcetra":
+            from ai.backend.common.lock import EtcetraLock
+
+            return lambda lock_id, lifetime_hint: EtcetraLock(
+                str(lock_id),
+                root_ctx.shared_config.etcetra_etcd,
+                lifetime=min(lifetime_hint * 2, lifetime_hint + 30),
+            )
+        case other:
+            raise ValueError(f"Invalid lock backend: {other}")
+
+
+def build_root_app(
+    pidx: int,
+    local_config: LocalConfig,
+    *,
+    cleanup_contexts: Sequence[CleanupContext] = None,
+    subapp_pkgs: Sequence[str] = None,
+    scheduler_opts: Mapping[str, Any] = None,
+) -> web.Application:
+    public_interface_objs.clear()
+    app = web.Application(
+        middlewares=[
+            exception_middleware,
+            api_middleware,
+        ]
+    )
+    root_ctx = RootContext()
+    global_exception_handler = functools.partial(handle_loop_error, root_ctx)
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(global_exception_handler)
+    app["_root.context"] = root_ctx
+    root_ctx.local_config = local_config
+    root_ctx.pidx = pidx
+    root_ctx.cors_options = {
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=False, expose_headers="*", allow_headers="*"
+        ),
+    }
+    default_scheduler_opts = {
+        "limit": 2048,
+        "close_timeout": 30,
+        "exception_handler": global_exception_handler,
+        "agent_selection_strategy": AgentSelectionStrategy.DISPERSED,
+    }
+    app["scheduler_opts"] = {
+        **default_scheduler_opts,
+        **(scheduler_opts if scheduler_opts is not None else {}),
+    }
+    app.on_response_prepare.append(on_prepare)
+
+    if cleanup_contexts is None:
+        cleanup_contexts = [
+            manager_status_ctx,
+            redis_ctx,
+            database_ctx,
+            distributed_lock_ctx,
+            event_dispatcher_ctx,
+            idle_checker_ctx,
+            storage_manager_ctx,
+            hook_plugin_ctx,
+            monitoring_ctx,
+            agent_registry_ctx,
+            sched_dispatcher_ctx,
+            background_task_ctx,
+            hanging_session_scanner_ctx,
+        ]
+
+    async def _cleanup_context_wrapper(cctx, app: web.Application) -> AsyncIterator[None]:
+        cctx_instance = cctx(app["_root.context"])
+        app["_cctx_instances"].append(cctx_instance)
+        try:
+            async with cctx_instance:
+                yield
+        except Exception as e:
+            exc_info = (type(e), e, e.__traceback__)
+            log.error("Error initializing cleanup_contexts: {0}", cctx.__name__, exc_info=exc_info)
+
+    async def _call_cleanup_context_shutdown_handlers(app: web.Application) -> None:
+        for cctx in app["_cctx_instances"]:
+            if hasattr(cctx, "shutdown"):
+                try:
+                    await cctx.shutdown()
+                except Exception:
+                    log.exception("error while shutting down a cleanup context")
+
+    app["_cctx_instances"] = []
+    app.on_shutdown.append(_call_cleanup_context_shutdown_handlers)
+    for cleanup_ctx in cleanup_contexts:
+        app.cleanup_ctx.append(
+            functools.partial(_cleanup_context_wrapper, cleanup_ctx),
+        )
+    cors = aiohttp_cors.setup(app, defaults=root_ctx.cors_options)
+    cors.add(app.router.add_route("GET", r"", hello))
+    cors.add(app.router.add_route("GET", r"/", hello))
+    if subapp_pkgs is None:
+        subapp_pkgs = []
+    for pkg_name in subapp_pkgs:
+        if pidx == 0:
+            log.info("Loading module: {0}", pkg_name[1:])
+        subapp_mod = importlib.import_module(pkg_name, "ai.backend.manager.api")
+        init_subapp(pkg_name, app, getattr(subapp_mod, "create_app"))
+
+    vendor_path = importlib.resources.files("ai.backend.manager.vendor")
+    assert isinstance(vendor_path, Path)
+    app.router.add_static("/static/vendor", path=vendor_path, name="static")
+    return app
+
+
+@actxmgr
+async def server_main(
+    loop: asyncio.AbstractEventLoop,
+    pidx: int,
+    _args: List[Any],
+) -> AsyncIterator[None]:
+    root_app = build_root_app(pidx, _args[0], subapp_pkgs=global_subapp_pkgs)
+    root_ctx: RootContext = root_app["_root.context"]
+    loop.set_debug(root_ctx.local_config["debug"]["asyncio"])
+    m = aiomonitor.Monitor(
+        loop,
+        termui_port=root_ctx.local_config["manager"]["aiomonitor-termui-port"] + pidx,
+        webui_port=root_ctx.local_config["manager"]["aiomonitor-webui-port"] + pidx,
+        console_enabled=False,
+        hook_task_factory=root_ctx.local_config["debug"]["enhanced-aiomonitor-task-info"],
+    )
+    m.prompt = f"monitor (manager[{pidx}@{os.getpid()}]) >>> "
+    m.console_locals["root_app"] = root_app
+    m.console_locals["root_ctx"] = root_ctx
+    aiomon_started = False

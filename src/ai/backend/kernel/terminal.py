@@ -89,39 +89,3 @@ class Terminal:
             return 1
         finally:
             await self.sock_out.send_multipart([b"finished", b"{}"])
-
-    async def start(self):
-        assert not self.accept_term_input
-        await safe_close_task(self.term_in_task)
-        await safe_close_task(self.term_out_task)
-        pid, fd = pty.fork()
-        if pid == 0:
-            args = shlex.split(self.shell_cmd)
-            os.execv(args[0], args)
-        else:
-            self.pid = pid
-            self.fd = fd
-
-            if self.sock_term_in is None:
-                self.sock_term_in = self.zctx.socket(zmq.SUB)
-                self.sock_term_in.bind("tcp://*:2002")
-                self.sock_term_in.subscribe(b"")
-            if self.sock_term_out is None:
-                self.sock_term_out = self.zctx.socket(zmq.PUB)
-                self.sock_term_out.bind("tcp://*:2003")
-
-            loop = asyncio.get_running_loop()
-            term_reader = asyncio.StreamReader()
-            term_read_protocol = asyncio.StreamReaderProtocol(term_reader)
-            await loop.connect_read_pipe(lambda: term_read_protocol, os.fdopen(self.fd, "rb"))
-
-            _reader_factory = lambda: asyncio.StreamReaderProtocol(asyncio.StreamReader())
-            term_writer_transport, term_writer_protocol = await loop.connect_write_pipe(
-                _reader_factory, os.fdopen(self.fd, "wb")
-            )
-            term_writer = asyncio.StreamWriter(term_writer_transport, term_writer_protocol, None)
-
-            self.term_in_task = asyncio.create_task(self.term_in(term_writer))
-            self.term_out_task = asyncio.create_task(self.term_out(term_reader))
-            self.accept_term_input = True
-            await asyncio.sleep(0)

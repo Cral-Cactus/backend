@@ -775,53 +775,6 @@ class BaseRunner(metaclass=ABCMeta):
         finally:
             self.subproc = None
 
-    async def run_tasks(self):
-        while True:
-            try:
-                coro = await self.task_queue.get()
-
-                if (
-                    self._build_success is not None
-                    and coro.func == self._execute
-                    and not self._build_success
-                ):
-                    self._build_success = None
-                    payload = json.dumps({
-                        "exitCode": 127,
-                    }).encode("utf8")
-                    await self.outsock.send_multipart([b"finished", payload])
-                    self.task_queue.task_done()
-                    continue
-
-                await coro()
-                self.task_queue.task_done()
-            except asyncio.CancelledError:
-                break
-
-    async def _handle_logs(self):
-        log_queue = self.log_queue.async_q
-        try:
-            while True:
-                rec = await log_queue.get()
-                await self.outsock.send_multipart(rec)
-                log_queue.task_done()
-        except asyncio.CancelledError:
-            self.log_queue.close()
-            await self.log_queue.wait_closed()
-
-    async def _get_apps(self, service_name):
-        result = {"status": "done", "data": []}
-        if self.service_parser is not None:
-            if service_name:
-                apps = await self.service_parser.get_apps(selected_service=service_name)
-            else:
-                apps = await self.service_parser.get_apps()
-            result["data"] = apps
-        await self.outsock.send_multipart([
-            b"apps-result",
-            json.dumps(result).encode("utf8"),
-        ])
-
     async def _monitor_processes(self):
         while True:
             self._pid_set_history.append(scan_proc_stats())

@@ -775,27 +775,159 @@ class BaseRunner(metaclass=ABCMeta):
         finally:
             self.subproc = None
 
-    async def shutdown(self):
-        pass
+    async def run_tasks(self):
+        while True:
+            try:
+                coro = await self.task_queue.get()
 
-            async def _shutdown_service(self, service_name: str):
-        try:
-            async with self._service_lock:
-                if service_name in self.services_running:
-                    await terminate_and_wait(self.services_running[service_name])
-                    self.services_running.pop(service_name, None)
-        except Exception:
-            log.exception("unexpected error (shutdown_service)")
+                if (
+                    self._build_success is not None
+                    and coro.func == self._execute
+                    and not self._build_success
+                ):
+                    self._build_success = None
+                    payload = json.dumps({
+                        "exitCode": 127,
+                    }).encode("utf8")
+                    await self.outsock.send_multipart([b"finished", payload])
+                    self.task_queue.task_done()
+                    continue
 
-    async def handle_user_input(self, reader, writer):
+                await coro()
+                self.task_queue.task_done()
+            except asyncio.CancelledError:
+                break
+
+    async def _handle_logs(self):
+        log_queue = self.log_queue.async_q
         try:
-            if self.user_input_queue is None:
-                writer.write(b"<user-input is unsupported>")
+            while True:
+                rec = await log_queue.get()
+                await self.outsock.send_multipart(rec)
+                log_queue.task_done()
+        except asyncio.CancelledError:
+            self.log_queue.close()
+            await self.log_queue.wait_closed()
+
+    async def _get_apps(self, service_name):
+        result = {"status": "done", "data": []}
+        if self.service_parser is not None:
+            if service_name:
+                apps = await self.service_parser.get_apps(selected_service=service_name)
             else:
-                await self.outsock.send_multipart([b"waiting-input", b""])
-                text = await self.user_input_queue.get()
-                writer.write(text.encode("utf8"))
-            await writer.drain()
-            writer.close()
-        except Exception:
-            log.exception("unexpected error (handle_user_input)")
+                apps = await self.service_parser.get_apps()
+            result["data"] = apps
+        await self.outsock.send_multipart([
+            b"apps-result",
+            json.dumps(result).encode("utf8"),
+        ])
+
+    async def _monitor_processes(self):
+        while True:
+            self._pid_set_history.append(scan_proc_stats())
+            if len(self._pid_set_history) > 2:
+                self._pid_set_history.pop(0)
+            try:
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                return
+
+    async def main_loop(self, cmdargs):
+        log.debug("starting user input server...")
+        user_input_server = await asyncio.start_unix_server(
+            self.handle_user_input, "/tmp/bai-user-input.sock"
+        )
+        log.debug("initializing krunner...")
+        await self._init_with_loop()
+        log.debug("initializing jupyter kernel...")
+        await self._init_jupyter_kernel()
+
+        user_bootstrap_path = Path("/home/work/bootstrap.sh")
+        if user_bootstrap_path.is_file():
+            log.debug("running user bootstrap script...")
+            await self._bootstrap(user_bootstrap_path)
+
+        self._pid_set_history = []
+        monitor_proc_task = asyncio.create_task(self._monitor_processes())
+
+        log.debug("starting intrinsic services: sshd, ttyd ...")
+        intrinsic_spawn_coros = []
+        intrinsic_spawn_coros.append(
+            self._start_service(
+                {
+                    "name": "sshd",
+                    "port": self.intrinsic_host_ports_mapping.get("sshd", 2200),
+                    "protocol": "tcp",
+                },
+            )
+        )
+        intrinsic_spawn_coros.append(
+            self._start_service(
+                {
+                    "name": "ttyd",
+                    "port": self.intrinsic_host_ports_mapping.get("ttyd", 7681),
+                    "protocol": "http",
+                },
+            )
+        )
+        results = await asyncio.gather(*intrinsic_spawn_coros, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                log.exception(
+                    "error during starting intrinsic services",
+                    exc_info=result,
+                )
+
+        log.debug("start serving...")
+        while True:
+            try:
+                data = await self.insock.recv_multipart()
+                if len(data) != 2:
+                    continue
+                op_type = data[0].decode("ascii")
+                text = data[1].decode("utf8")
+                if op_type == "clean":
+                    await self.task_queue.put(partial(self._clean, text))
+                if op_type == "build":
+                    await self.task_queue.put(partial(self._build, text))
+                elif op_type == "exec":
+                    await self.task_queue.put(partial(self._execute, text))
+                elif op_type == "code":
+                    await self.task_queue.put(partial(self._query, text))
+                elif op_type == "input":
+                    if self.user_input_queue is not None:
+                        await self.user_input_queue.put(text)
+                elif op_type == "complete":
+                    data = json.loads(text)
+                    await self._complete(data)
+                elif op_type == "interrupt":
+                    await self._interrupt()
+                elif op_type == "status":
+                    await self._send_status()
+                elif op_type == "event":
+                    data = json.loads(text)
+                    asyncio.create_task(self.log_event(data))
+                elif op_type == "start-model-service":
+                    data = json.loads(text)
+                    asyncio.create_task(self.start_model_service(data))
+                elif op_type == "start-service":
+                    data = json.loads(text)
+                    asyncio.create_task(self._start_service_and_feed_result(data))
+                elif op_type == "shutdown-service":
+                    data = json.loads(text)
+                    await self._shutdown_service(data)
+                elif op_type == "get-apps":
+                    await self._get_apps(text)
+            except asyncio.CancelledError:
+                break
+            except NotImplementedError:
+                log.error("Unsupported operation for this kernel: {0}", op_type)
+                await asyncio.sleep(0)
+            except Exception:
+                log.exception("main_loop: unexpected error")
+                continue
+        user_input_server.close()
+        await user_input_server.wait_closed()
+        monitor_proc_task.cancel()
+        await monitor_proc_task
+        await self.shutdown()

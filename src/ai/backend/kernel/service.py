@@ -108,26 +108,32 @@ class ServiceParser:
         for arg in service.command:
             cmdargs.append(arg.format_map(self.variables))
 
-        additional_arguments = dict(service.default_arguments)
-        if "arguments" in opts.keys() and opts["arguments"]:
-            for argname, argvalue in opts["arguments"].items():
-                if argname not in service.allowed_arguments:
-                    raise DisallowedArgument(
-                        f"Argument {argname} not allowed for service {service_name}"
-                    )
-                additional_arguments[argname] = argvalue
+        for arg_name, arg_value in additional_arguments.items():
+            cmdargs.append(arg_name)
+            if isinstance(arg_value, str):
+                cmdargs.append(arg_value)
+            elif isinstance(arg_value, list):
+                cmdargs += arg_value
 
-        for env_name, env_value in service.env.items():
-            env[env_name.format_map(self.variables)] = env_value.format_map(self.variables)
+        return cmdargs, env
 
-        if "envs" in opts.keys() and opts["envs"]:
-            for envname, envvalue in opts["envs"].items():
-                if envname not in service.allowed_envs:
-                    raise DisallowedEnvironment(
-                        f"Environment variable {envname} not allowed for service {service_name}"
-                    )
-                elif envname in frozen_envs:
-                    raise DisallowedEnvironment(
-                        f"Environment variable {envname} can't be overwritten"
-                    )
-                env[envname] = envvalue
+    async def get_apps(self, selected_service: str = "") -> Sequence[Mapping[str, Any]]:
+        def _format(service_name: str) -> Mapping[str, Any]:
+            service_info: Dict[str, Any] = {"name": service_name}
+            service = self.services[service_name]
+            if len(service.url_template) > 0:
+                service_info["url_template"] = service.url_template
+            if len(service.allowed_arguments) > 0:
+                service_info["allowed_arguments"] = service.allowed_arguments
+            if len(service.allowed_envs) > 0:
+                service_info["allowed_envs"] = service.allowed_envs
+            return service_info
+
+        apps = []
+        if selected_service:
+            if selected_service in self.services.keys():
+                apps.append(_format(selected_service))
+        else:
+            for service_name in self.services.keys():
+                apps.append(_format(service_name))
+        return apps

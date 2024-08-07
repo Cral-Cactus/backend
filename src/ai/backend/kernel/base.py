@@ -389,47 +389,227 @@ class BaseRunner(metaclass=ABCMeta):
 
     @abstractmethod
     async def build_heuristic(self) -> int:
-        """Process build step."""
 
-    async def _execute(self, exec_cmd: str) -> None:
-        ret = 0
+        async def output_hook(msg):
+            content = msg.get("content", "")
+            if msg["msg_type"] == "stream":
+                await self.outsock.send_multipart([
+                    content["name"].encode("ascii"),
+                    content["text"].encode("utf-8"),
+                ])
+            elif msg["msg_type"] == "error":
+                tbs = "\n".join(content["traceback"])
+                await self.outsock.send_multipart([b"stderr", tbs.encode("utf-8")])
+            elif msg["msg_type"] in ["execute_result", "display_data"]:
+                data = content["data"]
+                if len(data) < 1:
+                    return
+                if len(data) > 1:
+                    data.pop("text/plain", None)
+                dtype, dval = list(data.items())[0]
+
+                if dtype == "text/plain":
+                    await self.outsock.send_multipart([b"stdout", dval.encode("utf-8")])
+                elif dtype == "text/html":
+                    await self.outsock.send_multipart([b"media", dval.encode("utf-8")])
+                elif dtype in ["image/png", "image/jpeg"]:
+                    await self.outsock.send_multipart([
+                        b"media",
+                        json.dumps({
+                            "type": dtype,
+                            "data": f"data:{dtype};base64,{dval}",
+                        }).encode("utf-8"),
+                    ])
+                elif dtype == "image/svg+xml":
+                    await self.outsock.send_multipart([
+                        b"media",
+                        json.dumps({"type": dtype, "data": dval}).encode("utf8"),
+                    ])
+
+        async def stdin_hook(msg):
+            assert self.kernel_client is not None
+            assert self.user_input_queue is not None
+            if msg["msg_type"] == "input_request":
+                prompt = msg["content"]["prompt"]
+                password = msg["content"]["password"]
+                if prompt:
+                    await self.outsock.send_multipart([b"stdout", prompt.encode("utf-8")])
+                await self.outsock.send_multipart([
+                    b"waiting-input",
+                    json.dumps({"is_password": password}).encode("utf-8"),
+                ])
+                user_input = await self.user_input_queue.get()
+                self.kernel_client.input(user_input)
+
+        allow_stdin = False if self.user_input_queue is None else True
+        stdin_hook = None if self.user_input_queue is None else stdin_hook  # type: ignore
         try:
-            if exec_cmd is None or exec_cmd == "":
-                return
-            elif exec_cmd == "*":
-                ret = await self.execute_heuristic()
-            else:
-                ret = await self.run_subproc(exec_cmd, batch=True)
+            await aexecute_interactive(
+                self.kernel_client,
+                code_text,
+                timeout=None,
+                output_hook=output_hook,
+                allow_stdin=allow_stdin,
+                stdin_hook=stdin_hook,
+            )
+        except Exception as e:
+            log.exception(str(e))
+            return 127
+        return 0
+
+    async def _complete(self, completion_data) -> Sequence[str]:
+        result: Sequence[str] = []
+        try:
+            result = await self.complete(completion_data)
         except Exception:
             log.exception("unexpected error")
-            ret = -1
         finally:
-            await asyncio.sleep(0.01)
-            payload = json.dumps({
-                "exitCode": ret,
-            }).encode("utf8")
-            await self.outsock.send_multipart([b"finished", payload])
+            return result
+
+    async def complete(self, completion_data) -> Sequence[str]:
+        return []
+
+    async def _interrupt(self):
+        try:
+            if self.subproc:
+                self.subproc.send_signal(signal.SIGINT)
+                return
+            return await self.interrupt()
+        except Exception:
+            log.exception("unexpected error")
+        finally:
+            pass
+
+    async def interrupt(self):
+        if hasattr(self, "kernel_mgr") and self.kernel_mgr is not None:
+            await self.kernel_mgr.interrupt_kernel()
+
+    async def log_oom(self):
+        log.warning("Out-of-memory detected!")
+        prev_pid_set = {}
+        for history in self._pid_set_history:
+            prev_pid_set.update(history)
+        for _ in range(30):
+            current_pid_set = scan_proc_stats()
+            terminated_pid_list = sorted(set(prev_pid_set.keys()) - set(current_pid_set.keys()))
+            if not terminated_pid_list:
+                await asyncio.sleep(0.5)
+                continue
+            else:
+                break
+        else:
+            log.warning("failed to get the information of oom-killed processes")
+            return
+        pgsize = resource.getpagesize()
+        for pid, pstat in map(lambda p: (p, prev_pid_set[p]), terminated_pid_list):
+            process_tree = []
+            count = 0
+            while True:
+                if count > 0:
+                    indent = ("   " * (count - 1)) + "└─ "
+                else:
+                    indent = ""
+                cmdline = pstat["cmdline"].replace(b"\0", b" ").decode("utf8")
+                elapsed_time = "{:,.2f}".format(time.monotonic() - pstat["starttime"])
+                vm_size = "{:,}".format(pstat["vsize"] // (2**20))
+                rss = "{:,}".format((pstat["rss"] * pgsize) // (2**20))
+                process_tree.append(
+                    f"{indent}{pid} (running for {elapsed_time}s, vm: {vm_size}m, rss:"
+                    f" {rss}m): {cmdline}"
+                )
+                ppid = pstat["ppid"]
+                if ppid == 0 or ppid == pid:
+                    break
+                pid = ppid
+                pstat = prev_pid_set[ppid]
+                count += 1
+            log.warning(
+                "detected potentially oom-killed process:\n{}",
+                "\n".join(process_tree),
+            )
+
+    async def log_event(self, data):
+        match data["type"]:
+            case "oom":
+                await self.log_oom()
+            case _:
+                log.info(
+                    "Agent-notified event: {}",
+                    data,
+                )
+
+    async def _send_status(self):
+        data = {
+            "started_at": self.started_at,
+        }
+        await self.outsock.send_multipart([
+            b"status",
+            msgpack.packb(data, use_bin_type=True),
+        ])
 
     @abstractmethod
-    async def execute_heuristic(self) -> int:
+    async def start_service(self, service_info):
+        return None, {}
 
-    async def _query(self, code_text: str) -> None:
-        ret = 0
+    async def start_model_service(self, model_info):
+        assert self.service_parser is not None
+        model_service_info = model_info.get("service")
+        result = {}
+        started = False
         try:
-            ret = await self.query(code_text)
-        except Exception:
-            log.exception("unexpected error")
-            ret = -1
+            if model_service_info is None:
+                result = {"status": "failed", "error": "service info not provided"}
+                return
+            service_name = f"{model_info['name']}-{model_service_info['port']}"
+            self.service_parser.add_model_service(service_name, model_service_info)
+            service_info = {
+                "name": service_name,
+                "port": model_service_info["port"],
+                "ports": [model_service_info["port"]],
+                "protocol": "http",
+                "options": {},
+            }
+            result = await self._start_service(
+                service_info, cwd=model_info["model_path"], do_not_wait=True
+            )
+            started = result["status"] == "running" or result["status"] == "started"
         finally:
-            payload = json.dumps({
-                "exitCode": ret,
-            }).encode("utf8")
-            await self.outsock.send_multipart([b"finished", payload])
+            if not started:
+                result = {"status": "failed", "error": "service failed to start"}
+            await self.outsock.send_multipart([
+                b"model-service-result",
+                json.dumps(result).encode("utf8"),
+            ])
+            if started:
+                if model_service_info.get("health_check"):
+                    self._health_check_task = asyncio.create_task(
+                        self.check_model_health(model_info["name"], model_service_info)
+                    )
+                else:
+                    await self.outsock.send_multipart([
+                        b"model-service-status",
+                        json.dumps({"model_name": model_info["name"], "is_healthy": True}).encode(
+                            "utf8"
+                        ),
+                    ])
 
-    async def query(self, code_text) -> int:
-        if not hasattr(self, "kernel_mgr") or self.kernel_mgr is None:
-            log.error("query mode is disabled: failed to start jupyter kernel")
-            return 127
-
-        assert self.kernel_client is not None
-        log.debug("executing in query mode...")
+    async def check_model_health(self, model_name, model_service_info):
+        health_check_info = model_service_info.get("health_check")
+        health_check_endpoint = (
+            f"http://localhost:{model_service_info['port']}{health_check_info['path']}"
+        )
+        retries = 0
+        current_health_status = HealthStatus.UNDETERMINED
+        while True:
+            new_health_status = HealthStatus.UNHEALTHY
+            try:
+                async with asyncio.timeout(health_check_info["max_wait_time"]):
+                    try:
+                        resp = await asyncio.get_running_loop().run_in_executor(
+                            None, urllib.request.urlopen, health_check_endpoint
+                        )
+                        if resp.status == health_check_info["expected_status_code"]:
+                            new_health_status = HealthStatus.HEALTHY
+                    except urllib.error.URLError:
+                        pass
+                    await asyncio.sleep(health_check_info["max_wait_time"])

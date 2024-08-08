@@ -589,43 +589,218 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
         kernel_id: KernelId,
         container_id: str,
         async_log_iterator: AsyncIterator[bytes],
-    ) -> None:
-        chunk_size = self.local_config["agent"]["container-logs"]["chunk-size"]
-        log_key = f"containerlog.{container_id}"
-        log_length = 0
-        chunk_buffer = BytesIO()
-        chunk_length = 0
+    ) 
+
+        async def collect_node_stat(self, interval: float):
+        if self.local_config["debug"]["log-stats"]:
+            log.debug("collecting node statistics")
         try:
-            async with aiotools.aclosing(async_log_iterator):
-                async for fragment in async_log_iterator:
-                    fragment_length = len(fragment)
-                    chunk_buffer.write(fragment)
-                    chunk_length += fragment_length
-                    log_length += fragment_length
-                    while chunk_length >= chunk_size:
-                        cb = chunk_buffer.getbuffer()
-                        stored_chunk = bytes(cb[:chunk_size])
-                        await redis_helper.execute(
-                            self.redis_stream_pool,
-                            lambda r: r.rpush(log_key, stored_chunk),
-                        )
-                        remaining = cb[chunk_size:]
-                        chunk_length = len(remaining)
-                        next_chunk_buffer = BytesIO(remaining)
-                        next_chunk_buffer.seek(0, SEEK_END)
-                        del remaining, cb
-                        chunk_buffer.close()
-                        chunk_buffer = next_chunk_buffer
-            assert chunk_length < chunk_size
-            if chunk_length > 0:
-                await redis_helper.execute(
-                    self.redis_stream_pool,
-                    lambda r: r.rpush(log_key, chunk_buffer.getvalue()),
-                )
-        finally:
-            chunk_buffer.close()
-        await redis_helper.execute(
-            self.redis_stream_pool,
-            lambda r: r.expire(log_key, 3600),
+            await self.stat_ctx.collect_node_stat()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("unhandled exception while syncing node stats")
+            await self.produce_error_event()
+
+    async def collect_container_stat(self, interval: float):
+        if self.local_config["debug"]["log-stats"]:
+            log.debug("collecting container statistics")
+        try:
+            container_ids = []
+            async with self.registry_lock:
+                for kernel_id, kernel_obj in [*self.kernel_registry.items()]:
+                    if (
+                        not kernel_obj.stats_enabled
+                        or kernel_obj.state != KernelLifecycleStatus.RUNNING
+                    ):
+                        continue
+                    container_ids.append(kernel_obj["container_id"])
+                await self.stat_ctx.collect_container_stat(container_ids)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("unhandled exception while syncing container stats")
+            await self.produce_error_event()
+
+    async def collect_process_stat(self, interval: float):
+        if self.local_config["debug"]["log-stats"]:
+            log.debug("collecting process statistics in container")
+        try:
+            updated_kernel_ids = []
+            container_ids = []
+            async with self.registry_lock:
+                for kernel_id, kernel_obj in [*self.kernel_registry.items()]:
+                    if (
+                        not kernel_obj.stats_enabled
+                        or kernel_obj.state != KernelLifecycleStatus.RUNNING
+                    ):
+                        continue
+                    updated_kernel_ids.append(kernel_id)
+                    container_ids.append(kernel_obj["container_id"])
+                await self.stat_ctx.collect_per_container_process_stat(container_ids)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("unhandled exception while syncing process stats")
+            await self.produce_error_event()
+
+    def _get_public_host(self) -> str:
+        agent_config: Mapping[str, Any] = self.local_config["agent"]
+        container_config: Mapping[str, Any] = self.local_config["container"]
+        return (
+            agent_config.get("public-host")
+            or container_config.get("advertised-host")
+            or container_config["bind-host"]
         )
-        await self.produce_event(DoSyncKernelLogsEvent(kernel_id, container_id))
+
+    async def _handle_start_event(self, ev: ContainerLifecycleEvent) -> None:
+        async with self.registry_lock:
+            kernel_obj = self.kernel_registry.get(ev.kernel_id)
+            if kernel_obj is not None:
+                kernel_obj.stats_enabled = True
+                kernel_obj.state = KernelLifecycleStatus.RUNNING
+
+    async def _handle_destroy_event(self, ev: ContainerLifecycleEvent) -> None:
+        try:
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            if ev.kernel_id not in self._ongoing_destruction_tasks:
+                self._ongoing_destruction_tasks[ev.kernel_id] = current_task
+            async with self.registry_lock:
+                kernel_obj = self.kernel_registry.get(ev.kernel_id)
+                if kernel_obj is None:
+                    log.warning(
+                        "destroy_kernel(k:{0}, c:{1}) kernel missing (already dead?)",
+                        ev.kernel_id,
+                        ev.container_id,
+                    )
+                    if ev.container_id is None:
+                        await self.reconstruct_resource_usage()
+                        if not ev.suppress_events:
+                            await self.produce_event(
+                                KernelTerminatedEvent(
+                                    ev.kernel_id,
+                                    ev.session_id,
+                                    reason=KernelLifecycleEventReason.ALREADY_TERMINATED,
+                                ),
+                            )
+                        if ev.done_future is not None:
+                            ev.done_future.set_result(None)
+                        return
+                else:
+                    kernel_obj.state = KernelLifecycleStatus.TERMINATING
+                    kernel_obj.stats_enabled = False
+                    kernel_obj.termination_reason = ev.reason
+                    if kernel_obj.runner is not None:
+                        await kernel_obj.runner.close()
+                    kernel_obj.clean_event = ev.done_future
+                try:
+                    await self.destroy_kernel(ev.kernel_id, ev.container_id)
+                except Exception as e:
+                    if ev.done_future is not None:
+                        ev.done_future.set_exception(e)
+                    raise
+                finally:
+                    await self.container_lifecycle_queue.put(
+                        ContainerLifecycleEvent(
+                            ev.kernel_id,
+                            ev.session_id,
+                            ev.container_id,
+                            LifecycleEvent.CLEAN,
+                            ev.reason,
+                            suppress_events=ev.suppress_events,
+                            done_future=ev.done_future,
+                        ),
+                    )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.exception("unhandled exception while processing DESTROY event")
+            await self.produce_error_event()
+
+    async def _handle_clean_event(self, ev: ContainerLifecycleEvent) -> None:
+        destruction_task = self._ongoing_destruction_tasks.get(ev.kernel_id, None)
+        if destruction_task is not None and not destruction_task.done():
+            await destruction_task
+            del destruction_task
+        async with self.registry_lock:
+            try:
+                kernel_obj = self.kernel_registry.get(ev.kernel_id)
+                if kernel_obj is not None and kernel_obj.runner is not None:
+                    await kernel_obj.runner.close()
+                await self.clean_kernel(
+                    ev.kernel_id,
+                    ev.container_id,
+                    ev.kernel_id in self.restarting_kernels,
+                )
+            except Exception as e:
+                if ev.done_future is not None:
+                    ev.done_future.set_exception(e)
+                await self.produce_error_event()
+            finally:
+                if ev.kernel_id in self.restarting_kernels:
+                    kernel_obj = self.kernel_registry.get(ev.kernel_id, None)
+                else:
+                    kernel_obj = self.kernel_registry.pop(ev.kernel_id, None)
+                try:
+                    if kernel_obj is not None:
+                        port_range = self.local_config["container"]["port-range"]
+                        if host_ports := kernel_obj.get("host_ports"):
+                            restored_ports = [
+                                *filter(
+                                    lambda p: port_range[0] <= p <= port_range[1],
+                                    host_ports,
+                                )
+                            ]
+                            self.port_pool.update(restored_ports)
+                        await kernel_obj.close()
+                finally:
+                    if restart_tracker := self.restarting_kernels.get(ev.kernel_id, None):
+                        restart_tracker.destroy_event.set()
+                    else:
+                        await self.reconstruct_resource_usage()
+                        if not ev.suppress_events:
+                            await self.produce_event(
+                                KernelTerminatedEvent(
+                                    ev.kernel_id, ev.session_id, reason=ev.reason
+                                ),
+                            )
+                    if kernel_obj is not None and kernel_obj.clean_event is not None:
+                        kernel_obj.clean_event.set_result(None)
+                    if ev.done_future is not None and not ev.done_future.done():
+                        ev.done_future.set_result(None)
+
+    async def process_lifecycle_events(self) -> None:
+        async def lifecycle_task_exception_handler(
+            exc_type: Type[Exception],
+            exc_obj: Exception,
+            tb: TracebackType,
+        ) -> None:
+            log.exception("unexpected error in lifecycle task", exc_info=exc_obj)
+
+        async with aiotools.PersistentTaskGroup(
+            exception_handler=lifecycle_task_exception_handler,
+        ) as tg:
+            while True:
+                ev = await self.container_lifecycle_queue.get()
+                if isinstance(ev, Sentinel):
+                    await self.save_last_registry(force=True)
+                    return
+                if self.local_config["debug"]["log-events"]:
+                    log.info(f"lifecycle event: {ev!r}")
+                try:
+                    if ev.event == LifecycleEvent.START:
+                        tg.create_task(self._handle_start_event(ev))
+                    elif ev.event == LifecycleEvent.DESTROY:
+                        tg.create_task(self._handle_destroy_event(ev))
+                    elif ev.event == LifecycleEvent.CLEAN:
+                        tg.create_task(self._handle_clean_event(ev))
+                    else:
+                        log.warning("unsupported lifecycle event: {!r}", ev)
+                except Exception:
+                    log.exception(
+                        "unexpected error in process_lifecycle_events(): {!r}, continuing...",
+                        ev,
+                    )
+                finally:
+                    self.container_lifecycle_queue.task_done()

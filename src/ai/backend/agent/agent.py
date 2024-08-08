@@ -384,52 +384,248 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
             self,
             mode=StatModes(local_config["container"]["stats-type"]),
         )
-        self.timer_tasks = []
-        self.port_pool = set(
-            range(
-                local_config["container"]["port-range"][0],
-                local_config["container"]["port-range"][1] + 1,
+
+                alloc_map_mod.log_alloc_map = self.local_config["debug"]["log-alloc-map"]
+        computers = await self.load_resources()
+
+        all_devices: List[AbstractComputeDevice] = []
+        metadatas: List[AcceleratorMetadata] = []
+        for name, computer in computers.items():
+            devices = await computer.list_devices()
+            all_devices.extend(devices)
+            alloc_map = await computer.create_alloc_map()
+            self.computers[name] = ComputerContext(computer, devices, alloc_map)
+            metadatas.append(computer.get_metadata())
+
+        self.slots = await self.scan_available_resources()
+        log.info("Resource slots: {!r}", self.slots)
+        log.info("Slot types: {!r}", known_slot_types)
+        self.timer_tasks.append(aiotools.create_timer(self.update_slots, 30.0))
+
+        async def _pipeline(r: Redis):
+            pipe = r.pipeline()
+            for metadata in metadatas:
+                await pipe.hset(
+                    "computer.metadata",
+                    metadata["slot_name"],
+                    json.dumps(metadata),
+                )
+            return pipe
+
+        await redis_helper.execute(self.redis_stat_pool, _pipeline)
+
+        self.affinity_map = AffinityMap.build(all_devices)
+
+        if not self._skip_initial_scan:
+            self.images = await self.scan_images()
+            self.timer_tasks.append(aiotools.create_timer(self._scan_images_wrapper, 20.0))
+            await self.scan_running_kernels()
+
+        self.timer_tasks.append(aiotools.create_timer(self.collect_node_stat, 5.0))
+        self.timer_tasks.append(aiotools.create_timer(self.collect_container_stat, 5.0))
+        self.timer_tasks.append(aiotools.create_timer(self.collect_process_stat, 5.0))
+
+        heartbeat_interval = self.local_config["debug"]["heartbeat-interval"]
+        self.timer_tasks.append(aiotools.create_timer(self.heartbeat, heartbeat_interval))
+
+        sync_container_lifecycles_config = self.local_config["agent"]["sync-container-lifecycles"]
+        if sync_container_lifecycles_config["enabled"]:
+            self.timer_tasks.append(
+                aiotools.create_timer(
+                    self.sync_container_lifecycles, sync_container_lifecycles_config["interval"]
+                )
             )
+
+        if abuse_report_path := self.local_config["agent"].get("abuse-report-path"):
+            log.info(
+                "Monitoring abnormal kernel activities reported by Watcher at {}", abuse_report_path
+            )
+            abuse_report_path.mkdir(exist_ok=True, parents=True)
+            self.timer_tasks.append(aiotools.create_timer(self._cleanup_reported_kernels, 30.0))
+
+        self.timer_tasks.append(
+            aiotools.create_timer(self._report_all_kernel_commit_status_map, 7.0)
         )
-        self.stats_monitor = stats_monitor
-        self.error_monitor = error_monitor
-        self._pending_creation_tasks = defaultdict(set)
-        self._ongoing_exec_batch_tasks = weakref.WeakSet()
-        self._ongoing_destruction_tasks = weakref.WeakValueDictionary()
 
-            async def __ainit__(self) -> None:
+        loop = current_loop()
+        self.last_registry_written_time = time.monotonic()
+        self.container_lifecycle_handler = loop.create_task(self.process_lifecycle_events())
 
-        self.resource_lock = asyncio.Lock()
-        self.registry_lock = asyncio.Lock()
-        self.container_lifecycle_queue = asyncio.Queue()
+        await self.produce_event(AgentStartedEvent(reason="self-started"))
 
-        event_dispatcher_cls: type[EventDispatcher] | type[ExperimentalEventDispatcher]
-        if self.local_config["agent"].get("use-experimental-redis-event-dispatcher"):
-            event_dispatcher_cls = ExperimentalEventDispatcher
+        evd = self.event_dispatcher
+        evd.subscribe(DoVolumeMountEvent, self, handle_volume_mount, name="ag.volume.mount")
+        evd.subscribe(DoVolumeUnmountEvent, self, handle_volume_umount, name="ag.volume.umount")
+
+    async def shutdown(self, stop_signal: signal.Signals) -> None:
+
+        await cancel_tasks(self._ongoing_exec_batch_tasks)
+
+        async with self.registry_lock:
+            for kernel_obj in self.kernel_registry.values():
+                if kernel_obj.runner is not None:
+                    await kernel_obj.runner.close()
+                await kernel_obj.close()
+            await self.save_last_registry(force=True)
+            if stop_signal == signal.SIGTERM:
+                await self.clean_all_kernels(blocking=True)
+
+        cancel_results = await cancel_tasks(self.timer_tasks)
+        for result in cancel_results:
+            if isinstance(result, Exception):
+                log.error("timer cancellation error: {}", result)
+
+        await self.container_lifecycle_queue.put(_sentinel)
+        await self.container_lifecycle_handler
+
+        await self.produce_event(AgentTerminatedEvent(reason="shutdown"))
+
+        await self.event_producer.close()
+        await self.event_dispatcher.close()
+        await self.redis_stream_pool.close()
+        await self.redis_stat_pool.close()
+
+    async def produce_event(self, event: AbstractEvent) -> None:
+        if self.local_config["debug"]["log-heartbeats"]:
+            _log = log.debug if isinstance(event, AgentHeartbeatEvent) else log.info
         else:
-            event_dispatcher_cls = EventDispatcher
+            _log = (lambda *args: None) if isinstance(event, AgentHeartbeatEvent) else log.info
+        if self.local_config["debug"]["log-events"]:
+            _log("produce_event({0})", event)
+        if isinstance(event, KernelTerminatedEvent):
+            pending_creation_tasks = self._pending_creation_tasks.get(event.kernel_id, None)
+            if pending_creation_tasks is not None:
+                for t in set(pending_creation_tasks):
+                    if not t.done() and not t.cancelled():
+                        t.cancel()
+                        try:
+                            await t
+                        except asyncio.CancelledError:
+                            continue
+        if isinstance(event, KernelStartedEvent) or isinstance(event, KernelTerminatedEvent):
+            await self.save_last_registry()
+        await self.event_producer.produce_event(event, source=str(self.id))
 
-        self.event_producer = await EventProducer.new(
-            self.local_config["redis"],
-            db=REDIS_STREAM_DB,
-            log_events=self.local_config["debug"]["log-events"],
+    async def produce_error_event(
+        self,
+        exc_info: Tuple[Type[BaseException], BaseException, TracebackType] = None,
+    ) -> None:
+        exc_type, exc, tb = sys.exc_info() if exc_info is None else exc_info
+        pretty_message = "".join(traceback.format_exception_only(exc_type, exc)).strip()
+        pretty_tb = "".join(traceback.format_tb(tb)).strip()
+        await self.produce_event(AgentErrorEvent(pretty_message, pretty_tb))
+
+    async def _report_all_kernel_commit_status_map(self, interval: float) -> None:
+        loop = current_loop()
+        base_commit_path: Path = self.local_config["agent"]["image-commit-path"]
+        commit_kernels: set[str] = set()
+
+        def _map_commit_status() -> None:
+            for subdir in base_commit_path.iterdir():
+                for commit_path in subdir.glob("./**/lock/*"):
+                    kern = commit_path.name
+                    if kern not in commit_kernels:
+                        commit_kernels.add(kern)
+
+        await loop.run_in_executor(None, _map_commit_status)
+
+        commit_status_script = textwrap.dedent(
         )
-        self.event_dispatcher = await event_dispatcher_cls.new(
-            self.local_config["redis"],
-            db=REDIS_STREAM_DB,
-            log_events=self.local_config["debug"]["log-events"],
-            node_id=self.local_config["agent"]["id"],
-            consumer_group=EVENT_DISPATCHER_CONSUMER_GROUP,
-        )
-        self.redis_stream_pool = redis_helper.get_redis_object(
-            self.local_config["redis"],
-            name="stream",
-            db=REDIS_STREAM_DB,
-        )
-        self.redis_stat_pool = redis_helper.get_redis_object(
-            self.local_config["redis"],
-            name="stat",
-            db=REDIS_STAT_DB,
+        await redis_helper.execute_script(
+            self.redis_stat_pool,
+            "check_kernel_commit_statuses",
+            commit_status_script,
+            [f"kernel.{kern}.commit" for kern in commit_kernels],
+            [COMMIT_STATUS_EXPIRE],
         )
 
-        self.background_task_manager = BackgroundTaskManager(self.event_producer)
+    async def heartbeat(self, interval: float):
+        res_slots = {}
+        try:
+            for cctx in self.computers.values():
+                for slot_key, slot_type in cctx.instance.slot_types:
+                    res_slots[slot_key] = (
+                        slot_type,
+                        str(self.slots.get(slot_key, 0)),
+                    )
+            if self.local_config["agent"]["advertised-rpc-addr"]:
+                rpc_addr = self.local_config["agent"]["advertised-rpc-addr"]
+            else:
+                rpc_addr = self.local_config["agent"]["rpc-listen-addr"]
+            agent_info = {
+                "ip": str(rpc_addr.host),
+                "region": self.local_config["agent"]["region"],
+                "scaling_group": self.local_config["agent"]["scaling-group"],
+                "addr": f"tcp://{rpc_addr}",
+                "public_key": self.agent_public_key,
+                "public_host": str(self._get_public_host()),
+                "resource_slots": res_slots,
+                "version": VERSION,
+                "compute_plugins": {
+                    key: {
+                        "version": computer.instance.get_version(),
+                        **(await computer.instance.extra_info()),
+                    }
+                    for key, computer in self.computers.items()
+                },
+                "images": zlib.compress(
+                    msgpack.packb([(repo_tag, digest) for repo_tag, digest in self.images.items()])
+                ),
+                "images.opts": {"compression": "zlib"},
+                "architecture": get_arch_name(),
+                "auto_terminate_abusing_kernel": self.local_config["agent"][
+                    "force-terminate-abusing-containers"
+                ],
+            }
+            await self.produce_event(AgentHeartbeatEvent(agent_info))
+        except asyncio.TimeoutError:
+            log.warning("event dispatch timeout: instance_heartbeat")
+        except Exception:
+            log.exception("instance_heartbeat failure")
+            await self.produce_error_event()
+
+            async def collect_logs(
+        self,
+        kernel_id: KernelId,
+        container_id: str,
+        async_log_iterator: AsyncIterator[bytes],
+    ) -> None:
+        chunk_size = self.local_config["agent"]["container-logs"]["chunk-size"]
+        log_key = f"containerlog.{container_id}"
+        log_length = 0
+        chunk_buffer = BytesIO()
+        chunk_length = 0
+        try:
+            async with aiotools.aclosing(async_log_iterator):
+                async for fragment in async_log_iterator:
+                    fragment_length = len(fragment)
+                    chunk_buffer.write(fragment)
+                    chunk_length += fragment_length
+                    log_length += fragment_length
+                    while chunk_length >= chunk_size:
+                        cb = chunk_buffer.getbuffer()
+                        stored_chunk = bytes(cb[:chunk_size])
+                        await redis_helper.execute(
+                            self.redis_stream_pool,
+                            lambda r: r.rpush(log_key, stored_chunk),
+                        )
+                        remaining = cb[chunk_size:]
+                        chunk_length = len(remaining)
+                        next_chunk_buffer = BytesIO(remaining)
+                        next_chunk_buffer.seek(0, SEEK_END)
+                        del remaining, cb
+                        chunk_buffer.close()
+                        chunk_buffer = next_chunk_buffer
+            assert chunk_length < chunk_size
+            if chunk_length > 0:
+                await redis_helper.execute(
+                    self.redis_stream_pool,
+                    lambda r: r.rpush(log_key, chunk_buffer.getvalue()),
+                )
+        finally:
+            chunk_buffer.close()
+        await redis_helper.execute(
+            self.redis_stream_pool,
+            lambda r: r.expire(log_key, 3600),
+        )
+        await self.produce_event(DoSyncKernelLogsEvent(kernel_id, container_id))

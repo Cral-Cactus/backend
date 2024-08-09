@@ -1374,22 +1374,218 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
                             lambda s: s.strip(), self.local_config["container"]["jail-args"]
                         )
                     cmdargs += ["--"]
-                if self.local_config["debug"]["kernel-runner"]:
-                    krunner_opts.append("--debug")
-                cmdargs += [
-                    "/opt/backend/bin/python",
-                    "-s",
-                    "-m",
-                    "backend.kernel",
-                    *krunner_opts,
-                    runtime_type,
-                ]
-                if runtime_path is not None:
-                    cmdargs.append(runtime_path)
-
-                resource_spec.freeze()
-                await self.restart_kernel__store_config(
-                    kernel_id,
-                    "kconfig.dat",
-                    pickle.dumps(ctx.kernel_config),
+                    
+    async def start_and_monitor_model_service_health(
+        self,
+        kernel_obj: KernelObjectType,
+        model: Any,
+    ) -> None:
+        log.debug("starting model service of model {}", model["name"])
+        result = await kernel_obj.start_model_service(model)
+        if result["status"] == "failed":
+            await self.event_producer.produce_event(
+                ModelServiceStatusEvent(
+                    kernel_obj.kernel_id,
+                    kernel_obj.session_id,
+                    model["name"],
+                    ModelServiceStatus.UNHEALTHY,
                 )
+            )
+
+    async def load_model_definition(
+        self,
+        runtime_variant: RuntimeVariant,
+        model_folders: list[VFolderMount],
+        environ: MutableMapping[str, Any],
+        service_ports: list[ServicePort],
+        kernel_config: KernelCreationConfig,
+    ) -> Any:
+        image_command = await self.extract_image_command(kernel_config["image"]["canonical"])
+        if runtime_variant != RuntimeVariant.CUSTOM and not image_command:
+            raise AgentError(
+                "image should have its own command when runtime variant is set to values other than CUSTOM!"
+            )
+        assert len(model_folders) > 0
+        model_folder: VFolderMount = model_folders[0]
+
+        match runtime_variant:
+            case RuntimeVariant.VLLM:
+                _model = {
+                    "name": "vllm-model",
+                    "model_path": model_folder.kernel_path.as_posix(),
+                    "service": {
+                        "start_command": image_command,
+                        "port": MODEL_SERVICE_RUNTIME_PROFILES[RuntimeVariant.VLLM].port,
+                        "health_check": {
+                            "path": MODEL_SERVICE_RUNTIME_PROFILES[
+                                RuntimeVariant.VLLM
+                            ].health_check_endpoint,
+                        },
+                    },
+                }
+                raw_definition = {"models": [_model]}
+
+            case RuntimeVariant.NIM:
+                _model = {
+                    "name": "nim-model",
+                    "model_path": model_folder.kernel_path.as_posix(),
+                    "service": {
+                        "start_command": image_command,
+                        "port": MODEL_SERVICE_RUNTIME_PROFILES[RuntimeVariant.NIM].port,
+                        "health_check": {
+                            "path": MODEL_SERVICE_RUNTIME_PROFILES[
+                                RuntimeVariant.NIM
+                            ].health_check_endpoint,
+                        },
+                    },
+                }
+                raw_definition = {"models": [_model]}
+
+            case RuntimeVariant.CMD:
+                _model = {
+                    "name": "image-model",
+                    "model_path": model_folder.kernel_path.as_posix(),
+                    "service": {
+                        "start_command": image_command,
+                        "port": 8000,
+                    },
+                }
+                raw_definition = {"models": [_model]}
+
+            case RuntimeVariant.CUSTOM:
+                if _fname := (kernel_config.get("internal_data") or {}).get(
+                    "model_definition_path"
+                ):
+                    model_definition_candidates = [_fname]
+                else:
+                    model_definition_candidates = [
+                        "model-definition.yaml",
+                        "model-definition.yml",
+                    ]
+
+                model_definition_path = None
+                for filename in model_definition_candidates:
+                    if (Path(model_folder.host_path) / filename).is_file():
+                        model_definition_path = Path(model_folder.host_path) / filename
+                        break
+
+                if not model_definition_path:
+                    raise AgentError(
+                        f"Model definition file ({" or ".join(model_definition_candidates)}) does not exist under vFolder"
+                        f" {model_folder.name} (ID {model_folder.vfid})",
+                    )
+                try:
+                    model_definition_yaml = await asyncio.get_running_loop().run_in_executor(
+                        None, model_definition_path.read_text
+                    )
+                except FileNotFoundError as e:
+                    raise AgentError(
+                        "Model definition file (model-definition.yml) does not exist under"
+                        f" vFolder {model_folder.name} (ID {model_folder.vfid})",
+                    ) from e
+                try:
+                    raw_definition = yaml.load(model_definition_yaml, Loader=yaml.FullLoader)
+                except yaml.error.YAMLError as e:
+                    raise AgentError(f"Invalid YAML syntax: {e}") from e
+        try:
+            model_definition = model_definition_iv.check(raw_definition)
+            assert model_definition is not None
+            for model in model_definition["models"]:
+                if "BACKEND_MODEL_NAME" not in environ:
+                    environ["BACKEND_MODEL_NAME"] = model["name"]
+                environ["BACKEND_MODEL_PATH"] = model["model_path"]
+                if service := model.get("service"):
+                    if service["port"] in (2000, 2001):
+                        raise AgentError("Port 2000 and 2001 are reserved for internal use")
+                    overlapping_services = [
+                        s for s in service_ports if service["port"] in s["container_ports"]
+                    ]
+                    if len(overlapping_services) > 0:
+                        raise AgentError(
+                            f"Port {service['port']} overlaps with built-in service"
+                            f" {overlapping_services[0]['name']}"
+                        )
+                    service_ports.append({
+                        "name": f"{model['name']}-{service['port']}",
+                        "protocol": ServicePortProtocols.PREOPEN,
+                        "container_ports": (service["port"],),
+                        "host_ports": (None,),
+                        "is_inference": True,
+                    })
+            return model_definition
+        except DataError as e:
+            raise AgentError(
+                "Failed to validate model definition from vFolder"
+                f" {model_folder.name} (ID {model_folder.vfid})",
+            ) from e
+
+    def get_public_service_ports(self, service_ports: list[ServicePort]) -> list[ServicePort]:
+        return [port for port in service_ports if port["protocol"] != ServicePortProtocols.INTERNAL]
+
+    @abstractmethod
+    async def extract_image_command(self, image_ref: str) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def destroy_kernel(
+        self,
+        kernel_id: KernelId,
+        container_id: Optional[ContainerId],
+    ) -> None:
+
+    @abstractmethod
+    async def clean_kernel(
+        self,
+        kernel_id: KernelId,
+        container_id: Optional[ContainerId],
+        restarting: bool,
+    ) -> None:
+
+    @abstractmethod
+    async def create_local_network(self, network_name: str) -> None:
+
+    @abstractmethod
+    async def destroy_local_network(self, network_name: str) -> None:
+
+    @abstractmethod
+    async def restart_kernel__load_config(
+        self,
+        kernel_id: KernelId,
+        name: str,
+    ) -> bytes:
+        pass
+
+    @abstractmethod
+    async def restart_kernel__store_config(
+        self,
+        kernel_id: KernelId,
+        name: str,
+        data: bytes,
+    ) -> None:
+        pass
+
+    async def restart_kernel(
+        self,
+        session_id: SessionId,
+        kernel_id: KernelId,
+        updating_kernel_config: KernelCreationConfig,
+    ):
+        tracker = self.restarting_kernels.get(kernel_id)
+        if tracker is None:
+            tracker = RestartTracker(
+                request_lock=asyncio.Lock(),
+                destroy_event=asyncio.Event(),
+                done_event=asyncio.Event(),
+            )
+            self.restarting_kernels[kernel_id] = tracker
+
+        existing_kernel_config = pickle.loads(
+            await self.restart_kernel__load_config(kernel_id, "kconfig.dat"),
+        )
+        existing_cluster_info = json.loads(
+            await self.restart_kernel__load_config(kernel_id, "cluster.json"),
+        )
+        kernel_config = cast(
+            KernelCreationConfig,
+            {**existing_kernel_config, **updating_kernel_config},
+        )

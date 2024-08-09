@@ -1374,7 +1374,7 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
                             lambda s: s.strip(), self.local_config["container"]["jail-args"]
                         )
                     cmdargs += ["--"]
-                    
+
     async def start_and_monitor_model_service_health(
         self,
         kernel_obj: KernelObjectType,
@@ -1555,37 +1555,263 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
     ) -> bytes:
         pass
 
-    @abstractmethod
-    async def restart_kernel__store_config(
-        self,
-        kernel_id: KernelId,
-        name: str,
-        data: bytes,
-    ) -> None:
-        pass
+            async with tracker.request_lock:
+            tracker.done_event.clear()
+            await self.inject_container_lifecycle_event(
+                kernel_id,
+                session_id,
+                LifecycleEvent.DESTROY,
+                KernelLifecycleEventReason.RESTARTING,
+            )
+            try:
+                with timeout(60):
+                    await tracker.destroy_event.wait()
+            except asyncio.TimeoutError:
+                log.warning("timeout detected while restarting kernel {0}!", kernel_id)
+                self.restarting_kernels.pop(kernel_id, None)
+                await self.inject_container_lifecycle_event(
+                    kernel_id,
+                    session_id,
+                    LifecycleEvent.CLEAN,
+                    KernelLifecycleEventReason.RESTART_TIMEOUT,
+                )
+                raise
+            else:
+                try:
+                    await self.create_kernel(
+                        session_id,
+                        kernel_id,
+                        kernel_config,
+                        existing_cluster_info,
+                        restarting=True,
+                    )
+                    self.restarting_kernels.pop(kernel_id, None)
+                except Exception:
+                    log.exception(
+                        "restart_kernel(s:{}, k:{}): re-creation failure", session_id, kernel_id
+                    )
+            tracker.done_event.set()
+        kernel_obj = self.kernel_registry[kernel_id]
+        return {
+            "container_id": kernel_obj["container_id"],
+            "repl_in_port": kernel_obj["repl_in_port"],
+            "repl_out_port": kernel_obj["repl_out_port"],
+            "stdin_port": kernel_obj["stdin_port"],
+            "stdout_port": kernel_obj["stdout_port"],
+            "service_ports": kernel_obj.service_ports,
+        }
 
-    async def restart_kernel(
+    async def execute(
         self,
         session_id: SessionId,
         kernel_id: KernelId,
-        updating_kernel_config: KernelCreationConfig,
+        run_id: Optional[str],
+        mode: Literal["query", "batch", "input", "continue"],
+        text: str,
+        *,
+        opts: Mapping[str, Any],
+        api_version: int,
+        flush_timeout: float,
     ):
-        tracker = self.restarting_kernels.get(kernel_id)
-        if tracker is None:
-            tracker = RestartTracker(
-                request_lock=asyncio.Lock(),
-                destroy_event=asyncio.Event(),
-                done_event=asyncio.Event(),
-            )
-            self.restarting_kernels[kernel_id] = tracker
+        restart_tracker = self.restarting_kernels.get(kernel_id)
+        if restart_tracker is not None:
+            await restart_tracker.done_event.wait()
 
-        existing_kernel_config = pickle.loads(
-            await self.restart_kernel__load_config(kernel_id, "kconfig.dat"),
+        await self.produce_event(
+            ExecutionStartedEvent(session_id),
         )
-        existing_cluster_info = json.loads(
-            await self.restart_kernel__load_config(kernel_id, "cluster.json"),
+        try:
+            kernel_obj = self.kernel_registry[kernel_id]
+            result = await kernel_obj.execute(
+                run_id, mode, text, opts=opts, flush_timeout=flush_timeout, api_version=api_version
+            )
+        except asyncio.CancelledError:
+            await self.produce_event(
+                ExecutionCancelledEvent(session_id),
+            )
+            raise
+        except KeyError:
+            raise RuntimeError(
+                f"The container for kernel {kernel_id} is not found! "
+                "(might be terminated--try it again)"
+            ) from None
+
+        if result["status"] in ("finished", "exec-timeout"):
+            log.debug("_execute({0}) {1}", kernel_id, result["status"])
+        if result["status"] == "finished":
+            await self.produce_event(
+                ExecutionFinishedEvent(session_id),
+            )
+        elif result["status"] == "exec-timeout":
+            await self.produce_event(
+                ExecutionTimeoutEvent(session_id),
+            )
+            await self.inject_container_lifecycle_event(
+                kernel_id,
+                session_id,
+                LifecycleEvent.DESTROY,
+                KernelLifecycleEventReason.EXEC_TIMEOUT,
+            )
+        return {
+            **result,
+            "files": [],
+        }
+
+    async def get_completions(self, kernel_id: KernelId, text: str, opts: dict):
+        return await self.kernel_registry[kernel_id].get_completions(text, opts)
+
+    async def get_logs(self, kernel_id: KernelId):
+        return await self.kernel_registry[kernel_id].get_logs()
+
+    async def interrupt_kernel(self, kernel_id: KernelId):
+        return await self.kernel_registry[kernel_id].interrupt_kernel()
+
+    async def start_service(self, kernel_id: KernelId, service: str, opts: dict):
+        return await self.kernel_registry[kernel_id].start_service(service, opts)
+
+    async def shutdown_service(self, kernel_id: KernelId, service: str):
+        try:
+            kernel_obj = self.kernel_registry[kernel_id]
+            if kernel_obj is not None:
+                await kernel_obj.shutdown_service(service)
+        except Exception:
+            log.exception("unhandled exception while shutting down service app ${}", service)
+
+    async def commit(
+        self,
+        reporter,
+        kernel_id: KernelId,
+        subdir: str,
+        *,
+        canonical: str | None = None,
+        filename: str | None = None,
+        extra_labels: dict[str, str] = {},
+    ):
+        return await self.kernel_registry[kernel_id].commit(
+            kernel_id, subdir, canonical=canonical, filename=filename, extra_labels=extra_labels
         )
-        kernel_config = cast(
-            KernelCreationConfig,
-            {**existing_kernel_config, **updating_kernel_config},
+
+    async def get_commit_status(self, kernel_id: KernelId, subdir: str) -> CommitStatus:
+        return await self.kernel_registry[kernel_id].check_duplicate_commit(kernel_id, subdir)
+
+    async def accept_file(self, kernel_id: KernelId, filename: str, filedata):
+        return await self.kernel_registry[kernel_id].accept_file(filename, filedata)
+
+    async def download_file(self, kernel_id: KernelId, filepath: str):
+        return await self.kernel_registry[kernel_id].download_file(filepath)
+
+    async def download_single(self, kernel_id: KernelId, filepath: str):
+        return await self.kernel_registry[kernel_id].download_single(filepath)
+
+    async def list_files(self, kernel_id: KernelId, path: str):
+        return await self.kernel_registry[kernel_id].list_files(path)
+
+    async def ping_kernel(self, kernel_id: KernelId):
+        return await self.kernel_registry[kernel_id].ping()
+
+    async def save_last_registry(self, force=False) -> None:
+        now = time.monotonic()
+        if (not force) and (now <= self.last_registry_written_time + 60):
+            return
+        var_base_path = self.local_config["agent"]["var-base-path"]
+        last_registry_file = f"last_registry.{self.local_instance_id}.dat"
+        try:
+            with open(var_base_path / last_registry_file, "wb") as f:
+                pickle.dump(self.kernel_registry, f)
+            self.last_registry_written_time = now
+            log.debug("saved {}", last_registry_file)
+        except Exception as e:
+            log.exception("unable to save {}", last_registry_file, exc_info=e)
+            try:
+                os.remove(var_base_path / last_registry_file)
+            except FileNotFoundError:
+                pass
+
+
+async def handle_volume_mount(
+    context: AbstractAgent,
+    source: AgentId,
+    event: DoVolumeMountEvent,
+) -> None:
+    if context.local_config["agent"]["cohabiting-storage-proxy"]:
+        log.debug("Storage proxy is in the same node. Skip the volume task.")
+        await context.event_producer.produce_event(
+            VolumeMounted(
+                str(context.id),
+                VolumeMountableNodeType.AGENT,
+                "",
+                event.quota_scope_id,
+            )
         )
+        return
+    mount_prefix = await context.etcd.get("volumes/_mount")
+    volume_mount_prefix: str | None = context.local_config["agent"]["mount-path"]
+    if volume_mount_prefix is None:
+        volume_mount_prefix = "./"
+    real_path = Path(volume_mount_prefix, event.dir_name)
+    err_msg: str | None = None
+    try:
+        await mount(
+            str(real_path),
+            event.fs_location,
+            event.fs_type,
+            event.cmd_options,
+            event.edit_fstab,
+            event.fstab_path,
+            mount_prefix,
+        )
+    except VolumeMountFailed as e:
+        err_msg = str(e)
+    await context.event_producer.produce_event(
+        VolumeMounted(
+            str(context.id),
+            VolumeMountableNodeType.AGENT,
+            str(real_path),
+            event.quota_scope_id,
+            err_msg,
+        )
+    )
+
+
+async def handle_volume_umount(
+    context: AbstractAgent,
+    source: AgentId,
+    event: DoVolumeUnmountEvent,
+) -> None:
+    if context.local_config["agent"]["cohabiting-storage-proxy"]:
+        log.debug("Storage proxy is in the same node. Skip the volume task.")
+        await context.event_producer.produce_event(
+            VolumeUnmounted(
+                str(context.id),
+                VolumeMountableNodeType.AGENT,
+                "",
+                event.quota_scope_id,
+            )
+        )
+        return
+    mount_prefix = await context.etcd.get("volumes/_mount")
+    timeout = await context.etcd.get("config/watcher/file-io-timeout")
+    volume_mount_prefix = context.local_config["agent"]["mount-path"]
+    real_path = Path(volume_mount_prefix, event.dir_name)
+    err_msg: str | None = None
+    try:
+        did_umount = await umount(
+            str(real_path),
+            mount_prefix,
+            event.edit_fstab,
+            event.fstab_path,
+            timeout_sec=float(timeout) if timeout is not None else None,
+        )
+    except VolumeMountFailed as e:
+        err_msg = str(e)
+    if not did_umount:
+        log.warning(f"{real_path} does not exist. Skip umount")
+    await context.event_producer.produce_event(
+        VolumeUnmounted(
+            str(context.id),
+            VolumeMountableNodeType.AGENT,
+            str(real_path),
+            event.quota_scope_id,
+            err_msg,
+        )
+    )

@@ -955,44 +955,222 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
                             LifecycleEvent.DESTROY,
                             KernelLifecycleEventReason.TERMINATED_UNKNOWN_CONTAINER,
                         )
-                finally:
-                    terminated_kernel_ids = ",".join([
-                        str(kid) for kid in terminated_kernels.keys()
-                    ])
-                    if terminated_kernel_ids:
-                        log.debug(f"Terminate kernels(ids:[{terminated_kernel_ids}])")
-                    for kernel_id, ev in terminated_kernels.items():
-                        await self.container_lifecycle_queue.put(ev)
 
-                    await self.set_container_count(len(own_kernels.keys()))
-        except asyncio.CancelledError:
-            pass
-        except asyncio.TimeoutError:
-            log.warning("sync_container_lifecycles() timeout, continuing")
-        except Exception as e:
-            log.exception(f"sync_container_lifecycles() failure, continuing (detail: {repr(e)})")
-            await self.produce_error_event()
+    @abstractmethod
+    async def load_resources(
+        self,
+    ) -> Mapping[DeviceName, AbstractComputePlugin]:
 
-    async def set_container_count(self, container_count: int) -> None:
-        await redis_helper.execute(
-            self.redis_stat_pool, lambda r: r.set(f"container_count.{self.id}", container_count)
+    @abstractmethod
+    async def scan_available_resources(
+        self,
+    ) -> Mapping[SlotName, Decimal]:
+
+    async def update_slots(
+        self,
+        interval: float,
+    ) -> None:
+        self.slots = await self.scan_available_resources()
+        log.debug("slots: {!r}", self.slots)
+
+    async def gather_hwinfo(self) -> Mapping[str, HardwareMetadata]:
+        hwinfo: Dict[str, HardwareMetadata] = {}
+        tasks: list[Awaitable[tuple[DeviceName, Exception | HardwareMetadata]]] = []
+
+        async def _get(
+            key: DeviceName,
+            plugin: AbstractComputePlugin,
+        ) -> tuple[DeviceName, Exception | HardwareMetadata]:
+            try:
+                result = await plugin.get_node_hwinfo()
+                return key, result
+            except Exception as e:
+                return key, e
+
+        for device_name, plugin in self.computers.items():
+            tasks.append(_get(device_name, plugin.instance))
+        results = await asyncio.gather(*tasks)
+        for device_name, result in results:
+            match result:
+                case NotImplementedError():
+                    continue
+                case Exception():
+                    hwinfo[device_name] = {
+                        "status": "unavailable",
+                        "status_info": str(result),
+                        "metadata": {},
+                    }
+                case dict():
+                    hwinfo[device_name] = result
+        return hwinfo
+
+    async def _cleanup_reported_kernels(self, interval: float):
+        dest_path: Path = self.local_config["agent"]["abuse-report-path"]
+        auto_terminate: bool = self.local_config["agent"].get(
+            "force-terminate-abusing-containers", False
         )
 
-    async def clean_all_kernels(self, blocking: bool = False) -> None:
-        kernel_ids = [*self.kernel_registry.keys()]
-        clean_events = {}
-        loop = asyncio.get_running_loop()
-        if blocking:
-            for kernel_id in kernel_ids:
-                clean_events[kernel_id] = loop.create_future()
-        for kernel_id in kernel_ids:
-            await self.inject_container_lifecycle_event(
-                kernel_id,
-                self.kernel_registry[kernel_id].session_id,
-                LifecycleEvent.DESTROY,
-                KernelLifecycleEventReason.AGENT_TERMINATION,
-                done_future=clean_events[kernel_id] if blocking else None,
+        def _read(path: Path) -> str:
+            with open(path, "r") as fr:
+                return fr.read()
+
+        def _rm(path: Path) -> None:
+            os.remove(path)
+
+        terminated_kernels: dict[str, ContainerLifecycleEvent] = {}
+        abuse_report: dict[str, str] = {}
+        try:
+            async with FileLock(path=dest_path / "report.lock"):
+                for reported_kernel in dest_path.glob("report.*.json"):
+                    raw_body = await self.loop.run_in_executor(None, _read, reported_kernel)
+                    body: dict[str, str] = json.loads(raw_body)
+                    kern_id = body["ID"]
+                    if auto_terminate:
+                        log.debug("cleanup requested: {} ({})", body["ID"], body.get("reason"))
+                        kernel_id = KernelId(UUID(body["ID"]))
+                        kernel_obj = self.kernel_registry.get(kernel_id)
+                        if kernel_obj is None:
+                            continue
+                        abuse_report[kern_id] = AbuseReportValue.CLEANING.value
+                        session_id = kernel_obj.session_id
+                        terminated_kernels[body["ID"]] = ContainerLifecycleEvent(
+                            kernel_id,
+                            session_id,
+                            ContainerId(body["CID"]),
+                            LifecycleEvent.DESTROY,
+                            KernelLifecycleEventReason.from_value(body.get("reason"))
+                            or KernelLifecycleEventReason.ANOMALY_DETECTED,
+                        )
+                        await self.loop.run_in_executor(None, _rm, reported_kernel)
+                    else:
+                        abuse_report[kern_id] = AbuseReportValue.DETECTED.value
+                        log.debug(
+                            "abusing container detected, skipping auto-termination: {} ({})",
+                            kern_id,
+                            body.get("reason"),
+                        )
+        except Exception:
+            log.exception("error while paring abuse reports:")
+        finally:
+            for kid, ev in terminated_kernels.items():
+                await self.container_lifecycle_queue.put(ev)
+
+            hash_name = "abuse_report"
+            abuse_report_script = textwrap.dedent(
             )
-        if blocking:
-            waiters = [clean_events[kernel_id] for kernel_id in kernel_ids]
-            await asyncio.gather(*waiters)
+            await redis_helper.execute_script(
+                self.redis_stat_pool,
+                "report_abusing_kernels",
+                abuse_report_script,
+                [hash_name],
+                [json.dumps(abuse_report)],
+            )
+
+    @abstractmethod
+    async def scan_images(self) -> Mapping[str, str]:
+
+    async def _scan_images_wrapper(self, interval: float) -> None:
+        self.images = await self.scan_images()
+
+    @abstractmethod
+    async def push_image(self, image_ref: ImageRef, registry_conf: ImageRegistry) -> None:
+
+    @abstractmethod
+    async def pull_image(self, image_ref: ImageRef, registry_conf: ImageRegistry) -> None:
+
+    @abstractmethod
+    async def check_image(
+        self, image_ref: ImageRef, image_id: str, auto_pull: AutoPullBehavior
+    ) -> bool:
+        return False
+
+    async def scan_running_kernels(self) -> None:
+        ipc_base_path = self.local_config["agent"]["ipc-base-path"]
+        var_base_path = self.local_config["agent"]["var-base-path"]
+        last_registry_file = f"last_registry.{self.local_instance_id}.dat"
+        if os.path.isfile(ipc_base_path / last_registry_file):
+            shutil.move(ipc_base_path / last_registry_file, var_base_path / last_registry_file)
+        try:
+            with open(var_base_path / last_registry_file, "rb") as f:
+                self.kernel_registry = pickle.load(f)
+        except EOFError:
+            log.warning(
+                "Failed to load the last kernel registry: {}", (var_base_path / last_registry_file)
+            )
+        except FileNotFoundError:
+            pass
+        for kernel_obj in self.kernel_registry.values():
+            kernel_obj.agent_config = self.local_config
+            if kernel_obj.runner is not None:
+                kernel_obj.runner.event_producer = self.event_producer
+                await kernel_obj.runner.__ainit__()
+        async with self.registry_lock:
+            for kernel_id, container in await self.enumerate_containers(
+                ACTIVE_STATUS_SET | DEAD_STATUS_SET,
+            ):
+                session_id = SessionId(UUID(container.labels["ai.backend.session-id"]))
+                if container.status in ACTIVE_STATUS_SET:
+                    kernelspec = int(container.labels.get("ai.backend.kernelspec", "1"))
+                    if not (MIN_KERNELSPEC <= kernelspec <= MAX_KERNELSPEC):
+                        continue
+                    for p in container.ports:
+                        if p.host_port is not None:
+                            self.port_pool.discard(p.host_port)
+                    async with self.resource_lock:
+                        for computer_ctx in self.computers.values():
+                            await computer_ctx.instance.restore_from_container(
+                                container,
+                                computer_ctx.alloc_map,
+                            )
+                    await self.inject_container_lifecycle_event(
+                        kernel_id,
+                        session_id,
+                        LifecycleEvent.START,
+                        KernelLifecycleEventReason.RESUMING_AGENT_OPERATION,
+                        container_id=container.id,
+                    )
+                elif container.status in DEAD_STATUS_SET:
+                    log.info(
+                        "detected dead container while agent is down (k:{}, c:{})",
+                        kernel_id,
+                        container.id,
+                    )
+                    await self.inject_container_lifecycle_event(
+                        kernel_id,
+                        session_id,
+                        LifecycleEvent.CLEAN,
+                        KernelLifecycleEventReason.SELF_TERMINATED,
+                        container_id=container.id,
+                    )
+
+        log.info("starting with resource allocations")
+        for computer_name, computer_ctx in self.computers.items():
+            log.info("{}: {!r}", computer_name, dict(computer_ctx.alloc_map.allocations))
+
+    @abstractmethod
+    async def init_kernel_context(
+        self,
+        kernel_id: KernelId,
+        session_id: SessionId,
+        kernel_config: KernelCreationConfig,
+        *,
+        restarting: bool = False,
+        cluster_ssh_port_mapping: Optional[ClusterSSHPortMapping] = None,
+    ) -> AbstractKernelCreationContext:
+        raise NotImplementedError
+
+    async def execute_batch(
+        self,
+        session_id: SessionId,
+        kernel_id: KernelId,
+        startup_command: str,
+    ) -> None:
+        kernel_obj = self.kernel_registry.get(kernel_id, None)
+        if kernel_obj is None:
+            log.warning("execute_batch(k:{}): no such kernel", kernel_id)
+            return
+        log.debug("execute_batch(k:{}): executing {!r}", kernel_id, (startup_command or "")[:60])
+        mode: Literal["batch", "continue"] = "batch"
+        opts = {
+            "exec": startup_command,
+        }

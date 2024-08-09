@@ -1159,18 +1159,237 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
     ) -> AbstractKernelCreationContext:
         raise NotImplementedError
 
-    async def execute_batch(
+        async def create_batch_execution_task(
         self,
         session_id: SessionId,
         kernel_id: KernelId,
-        startup_command: str,
+        code_to_execute: str,
     ) -> None:
-        kernel_obj = self.kernel_registry.get(kernel_id, None)
-        if kernel_obj is None:
-            log.warning("execute_batch(k:{}): no such kernel", kernel_id)
-            return
-        log.debug("execute_batch(k:{}): executing {!r}", kernel_id, (startup_command or "")[:60])
-        mode: Literal["batch", "continue"] = "batch"
-        opts = {
-            "exec": startup_command,
-        }
+        self._ongoing_exec_batch_tasks.add(
+            asyncio.create_task(
+                self.execute_batch(session_id, kernel_id, code_to_execute),
+            ),
+        )
+
+    async def create_kernel(
+        self,
+        session_id: SessionId,
+        kernel_id: KernelId,
+        kernel_config: KernelCreationConfig,
+        cluster_info: ClusterInfo,
+        *,
+        restarting: bool = False,
+        throttle_sema: Optional[asyncio.Semaphore] = None,
+    ) -> KernelCreationResult:
+        if throttle_sema is None:
+            throttle_sema = asyncio.Semaphore(1)
+        async with throttle_sema:
+            if not restarting:
+                await self.produce_event(
+                    KernelPreparingEvent(kernel_id, session_id),
+                )
+
+            if self.local_config["debug"]["log-kernel-config"]:
+                log.debug("Kernel creation config: {0}", pretty(kernel_config))
+            ctx = await self.init_kernel_context(
+                kernel_id,
+                session_id,
+                kernel_config,
+                restarting=restarting,
+                cluster_ssh_port_mapping=cluster_info.get("cluster_ssh_port_mapping"),
+            )
+            environ: MutableMapping[str, str] = {**kernel_config["environ"]}
+
+            if KernelFeatures.UID_MATCH in ctx.kernel_features:
+                uid = self.local_config["container"]["kernel-uid"]
+                gid = self.local_config["container"]["kernel-gid"]
+                environ["LOCAL_USER_ID"] = str(uid)
+                environ["LOCAL_GROUP_ID"] = str(gid)
+            environ.update(
+                await ctx.get_extra_envs(),
+            )
+            image_labels = kernel_config["image"]["labels"]
+
+            agent_architecture = get_arch_name()
+            if agent_architecture != ctx.image_ref.architecture:
+                raise AgentError(
+                    f"cannot run {ctx.image_ref.architecture} image on"
+                    f" {agent_architecture} machine",
+                )
+
+            do_pull = (not ctx.image_ref.is_local) and await self.check_image(
+                ctx.image_ref,
+                kernel_config["image"]["digest"],
+                AutoPullBehavior(kernel_config.get("auto_pull", "digest")),
+            )
+            if do_pull:
+                await self.produce_event(
+                    KernelPullingEvent(kernel_id, session_id, ctx.image_ref.canonical),
+                )
+                await self.pull_image(ctx.image_ref, kernel_config["image"]["registry"])
+
+            if not restarting:
+                await self.produce_event(
+                    KernelCreatingEvent(kernel_id, session_id),
+                )
+
+            if not restarting:
+                resource_spec.mounts.extend(
+                    await ctx.get_intrinsic_mounts(),
+                )
+
+            if not restarting:
+                alloc_order = [
+                    DeviceName(name) for name in self.local_config["resource"]["allocation-order"]
+                ]
+                async with self.resource_lock:
+                    try:
+                        allocate(
+                            self.computers,
+                            resource_spec,
+                            alloc_order,
+                            self.affinity_map,
+                            self.local_config["resource"]["affinity-policy"],
+                        )
+                    except ResourceError:
+                        await self.produce_event(DoAgentResourceCheckEvent(ctx.agent_id))
+                        raise
+            try:
+                if not restarting:
+                    await ctx.prepare_scratch()
+
+                await ctx.apply_network(cluster_info)
+                await ctx.prepare_ssh(cluster_info)
+
+                vfolder_mounts = [VFolderMount.from_json(item) for item in kernel_config["mounts"]]
+                if not restarting:
+                    await ctx.mount_vfolders(vfolder_mounts, resource_spec)
+                    await ctx.mount_krunner(resource_spec, environ)
+
+                label_envs_corecount = image_labels.get("backend.envs.corecount", "")
+                envs_corecount = label_envs_corecount.split(",") if label_envs_corecount else []
+                cpu_core_count = len(resource_spec.allocations[DeviceName("cpu")][SlotName("cpu")])
+                environ.update({k: str(cpu_core_count) for k in envs_corecount if k not in environ})
+
+                await ctx.process_mounts(resource_spec.mounts)
+
+                attached_devices = {}
+                for dev_name, device_alloc in resource_spec.allocations.items():
+                    computer_ctx = self.computers[dev_name]
+                    devices = await computer_ctx.instance.get_attached_devices(device_alloc)
+                    attached_devices[dev_name] = devices
+
+                exposed_ports = [2000, 2001]
+                service_ports: List[ServicePort] = []
+                port_map: Dict[str, ServicePort] = {}
+                preopen_ports = ctx.kernel_config.get("preopen_ports")
+                if preopen_ports is None:
+                    preopen_ports = []
+
+                service_ports.append({
+                    "name": "sshd",
+                    "protocol": ServicePortProtocols.TCP,
+                    "container_ports": (2200,),
+                    "host_ports": (None,),
+                    "is_inference": False,
+                })
+                service_ports.append({
+                    "name": "ttyd",
+                    "protocol": ServicePortProtocols.HTTP,
+                    "container_ports": (7681,),
+                    "host_ports": (None,),
+                    "is_inference": False,
+                })
+
+                model_definition: Optional[Mapping[str, Any]] = None
+                model_folders = [
+                    folder
+                    for folder in vfolder_mounts
+                    if folder.usage_mode == VFolderUsageMode.MODEL
+                ]
+
+                if ctx.kernel_config["cluster_role"] in ("main", "master"):
+                    for sport in parse_service_ports(
+                        image_labels.get("backend.service-ports", ""),
+                        image_labels.get("backend.endpoint-ports", ""),
+                    ):
+                        port_map[sport["name"]] = sport
+                    for port_no in preopen_ports:
+                        if port_no in (2000, 2001):
+                            raise AgentError("Port 2000 and 2001 are reserved for internal use")
+                        overlapping_services = [
+                            s for s in service_ports if port_no in s["container_ports"]
+                        ]
+                        if len(overlapping_services) > 0:
+                            raise AgentError(
+                                f"Port {port_no} overlaps with built-in service"
+                                f" {overlapping_services[0]['name']}"
+                            )
+
+                        preopen_sport: ServicePort = {
+                            "name": str(port_no),
+                            "protocol": ServicePortProtocols.PREOPEN,
+                            "container_ports": (port_no,),
+                            "host_ports": (None,),
+                            "is_inference": False,
+                        }
+                        service_ports.append(preopen_sport)
+                        for cport in preopen_sport["container_ports"]:
+                            exposed_ports.append(cport)
+                    for sport in port_map.values():
+                        service_ports.append(sport)
+                        for cport in sport["container_ports"]:
+                            exposed_ports.append(cport)
+                    for index, port in enumerate(ctx.kernel_config["allocated_host_ports"]):
+                        service_ports.append({
+                            "name": f"hostport{index+1}",
+                            "protocol": ServicePortProtocols.INTERNAL,
+                            "container_ports": (port,),
+                            "host_ports": (port,),
+                            "is_inference": False,
+                        })
+                        exposed_ports.append(port)
+                    log.debug("exposed ports: {!r}", exposed_ports)
+                                    if kernel_config["session_type"] == SessionTypes.INFERENCE:
+                    model_definition = await self.load_model_definition(
+                        RuntimeVariant(
+                            (kernel_config["internal_data"] or {}).get("runtime_variant", "custom")
+                        ),
+                        model_folders,
+                        environ,
+                        service_ports,
+                        kernel_config,
+                    )
+
+                runtime_type = image_labels.get("backend.runtime-type", "app")
+                runtime_path = image_labels.get("backend.runtime-path", None)
+                cmdargs: list[str] = []
+                krunner_opts: list[str] = []
+                if self.local_config["container"]["sandbox-type"] == "jail":
+                    cmdargs += [
+                        "/opt/kernel/jail",
+                    ]
+                    if self.local_config["container"]["jail-args"]:
+                        cmdargs += map(
+                            lambda s: s.strip(), self.local_config["container"]["jail-args"]
+                        )
+                    cmdargs += ["--"]
+                if self.local_config["debug"]["kernel-runner"]:
+                    krunner_opts.append("--debug")
+                cmdargs += [
+                    "/opt/backend/bin/python",
+                    "-s",
+                    "-m",
+                    "backend.kernel",
+                    *krunner_opts,
+                    runtime_type,
+                ]
+                if runtime_path is not None:
+                    cmdargs.append(runtime_path)
+
+                resource_spec.freeze()
+                await self.restart_kernel__store_config(
+                    kernel_id,
+                    "kconfig.dat",
+                    pickle.dumps(ctx.kernel_config),
+                )

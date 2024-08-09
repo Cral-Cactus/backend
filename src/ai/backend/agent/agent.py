@@ -770,37 +770,229 @@ class AbstractKernelCreationContext(aobject, Generic[KernelObjectType]):
                     if ev.done_future is not None and not ev.done_future.done():
                         ev.done_future.set_result(None)
 
-    async def process_lifecycle_events(self) -> None:
-        async def lifecycle_task_exception_handler(
-            exc_type: Type[Exception],
-            exc_obj: Exception,
-            tb: TracebackType,
-        ) -> None:
-            log.exception("unexpected error in lifecycle task", exc_info=exc_obj)
-
-        async with aiotools.PersistentTaskGroup(
-            exception_handler=lifecycle_task_exception_handler,
-        ) as tg:
-            while True:
-                ev = await self.container_lifecycle_queue.get()
-                if isinstance(ev, Sentinel):
-                    await self.save_last_registry(force=True)
-                    return
-                if self.local_config["debug"]["log-events"]:
-                    log.info(f"lifecycle event: {ev!r}")
-                try:
-                    if ev.event == LifecycleEvent.START:
-                        tg.create_task(self._handle_start_event(ev))
-                    elif ev.event == LifecycleEvent.DESTROY:
-                        tg.create_task(self._handle_destroy_event(ev))
-                    elif ev.event == LifecycleEvent.CLEAN:
-                        tg.create_task(self._handle_clean_event(ev))
-                    else:
-                        log.warning("unsupported lifecycle event: {!r}", ev)
-                except Exception:
-                    log.exception(
-                        "unexpected error in process_lifecycle_events(): {!r}, continuing...",
-                        ev,
+    async def inject_container_lifecycle_event(
+        self,
+        kernel_id: KernelId,
+        session_id: SessionId,
+        event: LifecycleEvent,
+        reason: KernelLifecycleEventReason,
+        *,
+        container_id: Optional[ContainerId] = None,
+        exit_code: int = None,
+        done_future: asyncio.Future = None,
+        suppress_events: bool = False,
+    ) -> None:
+        cid: Optional[ContainerId] = None
+        try:
+            kernel_obj = self.kernel_registry[kernel_id]
+        except KeyError:
+            if event == LifecycleEvent.START:
+                pass
+            else:
+                log.warning(
+                    "injecting lifecycle event (e:{}) for unknown kernel (k:{})",
+                    event.name,
+                    kernel_id,
+                )
+        else:
+            assert kernel_obj is not None
+            if kernel_obj.termination_reason:
+                reason = kernel_obj.termination_reason
+            if container_id is not None:
+                if event == LifecycleEvent.START:
+                    kernel_obj["container_id"] = container_id
+                elif container_id != kernel_obj["container_id"]:
+                    log.warning(
+                        "container id mismatch for kernel_obj (k:{}, c:{}) with event (e:{}, c:{})",
+                        kernel_id,
+                        kernel_obj["container_id"],
+                        event.name,
+                        container_id,
                     )
+            cid = kernel_obj.get("container_id")
+        if cid is None:
+            log.warning(
+                "kernel has no container_id (k:{}) with event (e:{})",
+                kernel_id,
+                event.name,
+            )
+        await self.container_lifecycle_queue.put(
+            ContainerLifecycleEvent(
+                kernel_id,
+                session_id,
+                cid,
+                event,
+                reason,
+                done_future,
+                exit_code,
+                suppress_events,
+            ),
+        )
+
+    @abstractmethod
+    async def resolve_image_distro(self, image: ImageConfig) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def enumerate_containers(
+        self,
+        status_filter: FrozenSet[ContainerStatus] = ACTIVE_STATUS_SET,
+    ) -> Sequence[Tuple[KernelId, Container]]:
+
+    async def reconstruct_resource_usage(self) -> None:
+        async with self.resource_lock:
+            for computer_ctx in self.computers.values():
+                computer_ctx.alloc_map.clear()
+            for kernel_id, container in await self.enumerate_containers():
+                for computer_ctx in self.computers.values():
+                    try:
+                        await computer_ctx.instance.restore_from_container(
+                            container,
+                            computer_ctx.alloc_map,
+                        )
+                    except Exception:
+                        log.warning(
+                            "rescan_resource_usage(k:{}): "
+                            "failed to read kernel resource info; "
+                            "maybe already terminated",
+                            kernel_id,
+                        )
+
+    async def sync_container_lifecycles(self, interval: float) -> None:
+        known_kernels: Dict[KernelId, ContainerId | None] = {}
+        alive_kernels: Dict[KernelId, ContainerId] = {}
+        kernel_session_map: Dict[KernelId, SessionId] = {}
+        own_kernels: dict[KernelId, ContainerId] = {}
+        terminated_kernels: dict[KernelId, ContainerLifecycleEvent] = {}
+
+        def _get_session_id(container: Container) -> SessionId | None:
+            _session_id = container.labels.get("ai.backend.session-id")
+            try:
+                return SessionId(UUID(_session_id))
+            except ValueError:
+                log.warning(
+                    f"sync_container_lifecycles() invalid session-id (cid: {container.id}, sid:{_session_id})"
+                )
+                return None
+
+        log.debug("sync_container_lifecycles(): triggered")
+        try:
+            _containers = await self.enumerate_containers(ACTIVE_STATUS_SET | DEAD_STATUS_SET)
+            async with self.registry_lock:
+                try:
+                    dead_containers = [
+                        (kid, container)
+                        for kid, container in _containers
+                        if container.status in DEAD_STATUS_SET
+                    ]
+                    log.debug(
+                        f"detected dead containers: {[container.id[:12] for _, container in dead_containers]}"
+                    )
+                    for kernel_id, container in dead_containers:
+                        if kernel_id in self.restarting_kernels:
+                            continue
+                        log.info(
+                            "detected dead container during lifeycle sync (k:{}, c:{})",
+                            kernel_id,
+                            container.id,
+                        )
+                        session_id = _get_session_id(container)
+                        if session_id is None:
+                            continue
+                        terminated_kernels[kernel_id] = ContainerLifecycleEvent(
+                            kernel_id,
+                            session_id,
+                            container.id,
+                            LifecycleEvent.CLEAN,
+                            KernelLifecycleEventReason.SELF_TERMINATED,
+                        )
+                    active_containers = [
+                        (kid, container)
+                        for kid, container in _containers
+                        if container.status in ACTIVE_STATUS_SET
+                    ]
+                    log.debug(
+                        f"detected active containers: {[container.id[:12] for _, container in active_containers]}"
+                    )
+                    for kernel_id, container in active_containers:
+                        alive_kernels[kernel_id] = container.id
+                        session_id = _get_session_id(container)
+                        if session_id is None:
+                            continue
+                        kernel_session_map[kernel_id] = session_id
+                        own_kernels[kernel_id] = container.id
+                    for kernel_id, kernel_obj in self.kernel_registry.items():
+                        known_kernels[kernel_id] = (
+                            ContainerId(kernel_obj.container_id)
+                            if kernel_obj.container_id is not None
+                            else None
+                        )
+                        session_id = kernel_obj.session_id
+                        kernel_session_map[kernel_id] = session_id
+                    for kernel_id in known_kernels.keys() - alive_kernels.keys():
+                        kernel_obj = self.kernel_registry[kernel_id]
+                        if (
+                            kernel_id in self.restarting_kernels
+                            or kernel_obj.state != KernelLifecycleStatus.RUNNING
+                        ):
+                            continue
+                        log.debug(f"kernel with no container (kid: {kernel_id})")
+                        terminated_kernels[kernel_id] = ContainerLifecycleEvent(
+                            kernel_id,
+                            kernel_session_map[kernel_id],
+                            known_kernels[kernel_id],
+                            LifecycleEvent.CLEAN,
+                            KernelLifecycleEventReason.CONTAINER_NOT_FOUND,
+                        )
+                    for kernel_id in alive_kernels.keys() - known_kernels.keys():
+                        if kernel_id in self.restarting_kernels:
+                            continue
+                        log.debug(f"kernel not found in registry (kid:{kernel_id})")
+                        terminated_kernels[kernel_id] = ContainerLifecycleEvent(
+                            kernel_id,
+                            kernel_session_map[kernel_id],
+                            alive_kernels[kernel_id],
+                            LifecycleEvent.DESTROY,
+                            KernelLifecycleEventReason.TERMINATED_UNKNOWN_CONTAINER,
+                        )
                 finally:
-                    self.container_lifecycle_queue.task_done()
+                    terminated_kernel_ids = ",".join([
+                        str(kid) for kid in terminated_kernels.keys()
+                    ])
+                    if terminated_kernel_ids:
+                        log.debug(f"Terminate kernels(ids:[{terminated_kernel_ids}])")
+                    for kernel_id, ev in terminated_kernels.items():
+                        await self.container_lifecycle_queue.put(ev)
+
+                    await self.set_container_count(len(own_kernels.keys()))
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            log.warning("sync_container_lifecycles() timeout, continuing")
+        except Exception as e:
+            log.exception(f"sync_container_lifecycles() failure, continuing (detail: {repr(e)})")
+            await self.produce_error_event()
+
+    async def set_container_count(self, container_count: int) -> None:
+        await redis_helper.execute(
+            self.redis_stat_pool, lambda r: r.set(f"container_count.{self.id}", container_count)
+        )
+
+    async def clean_all_kernels(self, blocking: bool = False) -> None:
+        kernel_ids = [*self.kernel_registry.keys()]
+        clean_events = {}
+        loop = asyncio.get_running_loop()
+        if blocking:
+            for kernel_id in kernel_ids:
+                clean_events[kernel_id] = loop.create_future()
+        for kernel_id in kernel_ids:
+            await self.inject_container_lifecycle_event(
+                kernel_id,
+                self.kernel_registry[kernel_id].session_id,
+                LifecycleEvent.DESTROY,
+                KernelLifecycleEventReason.AGENT_TERMINATION,
+                done_future=clean_events[kernel_id] if blocking else None,
+            )
+        if blocking:
+            waiters = [clean_events[kernel_id] for kernel_id in kernel_ids]
+            await asyncio.gather(*waiters)
